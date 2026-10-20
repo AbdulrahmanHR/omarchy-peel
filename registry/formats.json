@@ -1,0 +1,119 @@
+{
+  "version": 1,
+  "kinds": {
+    "image": {
+      "engine": "magick",
+      "outputs": ["jpg", "png", "webp", "avif", "heic", "tiff", "bmp", "gif", "pdf"]
+    },
+    "vector": {
+      "engine": "rsvg",
+      "outputs": ["png", "pdf", "jpg", "webp"]
+    },
+    "audio": {
+      "engine": "ffmpeg",
+      "outputs": ["mp3", "m4a", "wav", "flac", "ogg", "opus", "aiff", "wma"]
+    },
+    "video": {
+      "engine": "ffmpeg",
+      "outputs": ["mp4", "mov", "mkv", "webm", "avi", "wmv", "gif", "mp3"]
+    },
+    "document": {
+      "outputs": ["pdf", "docx", "odt", "txt", "html", "md", "epub"],
+      "routes": [
+        { "engine": "soffice", "inputs": ["docx", "doc", "odt", "rtf", "txt", "html"], "outputs": ["pdf", "docx", "odt", "txt", "html"] },
+        { "engine": "pandoc", "inputs": ["docx", "odt", "rtf", "txt", "html", "md", "epub"], "outputs": ["docx", "odt", "txt", "html", "md", "epub"] }
+      ]
+    },
+    "spreadsheet": {
+      "engine": "soffice",
+      "outputs": ["xlsx", "ods", "csv", "tsv", "pdf"]
+    },
+    "slides": {
+      "outputs": ["pdf", "pptx", "odp", "png", "jpg"],
+      "routes": [
+        { "engine": "soffice", "outputs": ["pdf", "pptx", "odp"] },
+        { "engine": "soffice-raster", "outputs": ["png", "jpg"] }
+      ]
+    },
+    "pdf": {
+      "outputs": ["png", "jpg", "txt", "docx"],
+      "routes": [
+        { "engine": "poppler-raster", "outputs": ["png", "jpg"] },
+        { "engine": "poppler-text", "outputs": ["txt"] },
+        { "engine": "pdf2docx", "outputs": ["docx"] }
+      ]
+    },
+    "archive": {
+      "engine": "archive",
+      "outputs": ["zip", "tar", "tar.gz", "7z"]
+    }
+  },
+  "formats": {
+    "jpg":  { "label": "JPG",  "kinds": ["image"], "aliases": ["jpeg", "jpe"], "coder": "JPEG", "mime": ["image/jpeg"], "quality": "std" },
+    "png":  { "label": "PNG",  "kinds": ["image"], "coder": "PNG", "mime": ["image/png"] },
+    "webp": { "label": "WebP", "kinds": ["image"], "coder": "WEBP", "mime": ["image/webp"], "multiframe": true, "quality": "std" },
+    "avif": { "label": "AVIF", "kinds": ["image"], "coder": "AVIF", "mime": ["image/avif"], "quality": "avif" },
+    "heic": { "label": "HEIC", "kinds": ["image"], "aliases": ["heif"], "coder": "HEIC", "mime": ["image/heic", "image/heif"], "quality": "std" },
+    "tiff": { "label": "TIFF", "kinds": ["image"], "aliases": ["tif"], "coder": "TIFF", "mime": ["image/tiff"], "multiframe": true },
+    "bmp":  { "label": "BMP",  "kinds": ["image"], "coder": "BMP", "mime": ["image/bmp", "image/x-ms-bmp"] },
+    "jxl":  { "label": "JXL",  "kinds": ["image"], "coder": "JXL", "mime": ["image/jxl"], "inputOnly": true },
+    "pdf":  { "label": "PDF",  "kinds": ["pdf"], "coder": "PDF", "mime": ["application/pdf"], "multiframe": true },
+    "svg":  { "label": "SVG",  "kinds": ["vector"], "mime": ["image/svg+xml"], "inputOnly": true },
+    "gif":  { "label": "GIF",  "kinds": ["video", "image"], "coder": "GIF", "mime": ["image/gif"], "multiframe": true, "silent": true },
+
+    "docx": { "label": "DOCX", "kinds": ["document"], "mime": ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"], "soffice": "docx:MS Word 2007 XML" },
+    "doc":  { "label": "DOC",  "kinds": ["document"], "mime": ["application/msword"], "inputOnly": true },
+    "odt":  { "label": "ODT",  "kinds": ["document"], "mime": ["application/vnd.oasis.opendocument.text"], "soffice": "odt:writer8" },
+    "rtf":  { "label": "RTF",  "kinds": ["document"], "mime": ["application/rtf", "text/rtf"], "inputOnly": true },
+    "txt":  { "label": "TXT",  "kinds": ["document"], "aliases": ["text"], "mime": ["text/plain"], "soffice": "txt:Text (encoded):UTF8" },
+    "md":   { "label": "Markdown", "kinds": ["document"], "aliases": ["markdown"], "mime": ["text/markdown"] },
+    "html": { "label": "HTML", "kinds": ["document"], "aliases": ["htm"], "mime": ["text/html"], "soffice": "html:HTML (StarWriter)" },
+    "epub": { "label": "EPUB", "kinds": ["document"], "mime": ["application/epub+zip"] },
+
+    "xlsx": { "label": "XLSX", "kinds": ["spreadsheet"], "mime": ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"], "soffice": "xlsx:Calc MS Excel 2007 XML" },
+    "xls":  { "label": "XLS",  "kinds": ["spreadsheet"], "mime": ["application/vnd.ms-excel"], "inputOnly": true },
+    "ods":  { "label": "ODS",  "kinds": ["spreadsheet"], "mime": ["application/vnd.oasis.opendocument.spreadsheet"], "soffice": "ods:calc8" },
+    "csv":  { "label": "CSV",  "kinds": ["spreadsheet"], "mime": ["text/csv"],
+              "infilter": "Text - txt - csv (StarCalc):44,34,76,1", "soffice": "csv:Text - txt - csv (StarCalc):44,34,76,1,,0,false,true,false,false,false" },
+    "tsv":  { "label": "TSV",  "kinds": ["spreadsheet"], "mime": ["text/tab-separated-values"],
+              "infilter": "Text - txt - csv (StarCalc):9,34,76,1", "soffice": "tsv:Text - txt - csv (StarCalc):9,34,76,1,,0,false,true,false,false,false" },
+
+    "pptx": { "label": "PPTX", "kinds": ["slides"], "mime": ["application/vnd.openxmlformats-officedocument.presentationml.presentation"], "soffice": "pptx:Impress MS PowerPoint 2007 XML" },
+    "ppt":  { "label": "PPT",  "kinds": ["slides"], "mime": ["application/vnd.ms-powerpoint"], "inputOnly": true },
+    "odp":  { "label": "ODP",  "kinds": ["slides"], "mime": ["application/vnd.oasis.opendocument.presentation"], "soffice": "odp:impress8" },
+
+    "zip":    { "label": "ZIP",    "kinds": ["archive"], "mime": ["application/zip"] },
+    "tar":    { "label": "TAR",    "kinds": ["archive"], "mime": ["application/x-tar"] },
+    "tar.gz": { "label": "TAR.GZ", "kinds": ["archive"], "aliases": ["tgz"] },
+    "tar.xz": { "label": "TAR.XZ", "kinds": ["archive"], "aliases": ["txz"], "inputOnly": true },
+    "tar.bz2": { "label": "TAR.BZ2", "kinds": ["archive"], "aliases": ["tbz2", "tbz"], "inputOnly": true },
+    "7z":     { "label": "7Z",     "kinds": ["archive"], "mime": ["application/x-7z-compressed"] },
+    "rar":    { "label": "RAR",    "kinds": ["archive"], "mime": ["application/vnd.rar", "application/x-rar"], "inputOnly": true },
+
+    "mp3":  { "label": "MP3",  "kinds": ["audio"], "mime": ["audio/mpeg"], "audioOnly": true, "ffmpeg": ["-c:a", "libmp3lame"] },
+    "m4a":  { "label": "M4A",  "kinds": ["audio"], "mime": ["audio/mp4", "audio/x-m4a"], "audioOnly": true, "ffmpeg": ["-c:a", "aac"] },
+    "wav":  { "label": "WAV",  "kinds": ["audio"], "mime": ["audio/wav", "audio/x-wav"], "audioOnly": true, "ffmpeg": ["-c:a", "pcm_s16le"] },
+    "flac": { "label": "FLAC", "kinds": ["audio"], "mime": ["audio/flac", "audio/x-flac"], "audioOnly": true, "ffmpeg": ["-c:a", "flac"] },
+    "ogg":  { "label": "OGG",  "kinds": ["audio"], "aliases": ["oga"], "mime": ["audio/ogg"], "audioOnly": true, "ffmpeg": ["-c:a", "libvorbis"] },
+    "opus": { "label": "Opus", "kinds": ["audio"], "mime": ["audio/opus"], "audioOnly": true, "ffmpeg": ["-c:a", "libopus"] },
+    "aiff": { "label": "AIFF", "kinds": ["audio"], "aliases": ["aif"], "mime": ["audio/aiff", "audio/x-aiff"], "audioOnly": true, "ffmpeg": ["-c:a", "pcm_s16be"] },
+    "wma":  { "label": "WMA",  "kinds": ["audio"], "mime": ["audio/x-ms-wma"], "audioOnly": true, "ffmpeg": ["-c:a", "wmav2"] },
+    "aac":  { "label": "AAC",  "kinds": ["audio"], "mime": ["audio/aac"], "audioOnly": true, "inputOnly": true },
+
+    "mp4":  { "label": "MP4",  "kinds": ["video"], "aliases": ["m4v"], "mime": ["video/mp4"],
+              "ffmpeg": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart"] },
+    "mov":  { "label": "MOV",  "kinds": ["video"], "mime": ["video/quicktime"],
+              "ffmpeg": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"] },
+    "mkv":  { "label": "MKV",  "kinds": ["video"], "mime": ["video/x-matroska"],
+              "ffmpeg": ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac"] },
+    "webm": { "label": "WebM", "kinds": ["video"], "mime": ["video/webm"],
+              "ffmpeg": ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p", "-b:v", "0", "-row-mt", "1", "-deadline", "good", "-cpu-used", "4", "-c:a", "libopus"] },
+    "avi":  { "label": "AVI",  "kinds": ["video"], "mime": ["video/x-msvideo"],
+              "ffmpeg": ["-c:v", "mpeg4", "-pix_fmt", "yuv420p", "-c:a", "libmp3lame"] },
+    "wmv":  { "label": "WMV",  "kinds": ["video"], "mime": ["video/x-ms-wmv"],
+              "ffmpeg": ["-c:v", "wmv2", "-pix_fmt", "yuv420p", "-c:a", "wmav2"] }
+  },
+  "gif": {
+    "filter": "fps={fps}{scale},split[a][b];[a]palettegen=stats_mode=diff[p];[b][p]paletteuse=dither=bayer:bayer_scale=4"
+  }
+}

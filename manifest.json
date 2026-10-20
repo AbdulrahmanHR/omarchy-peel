@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.abdulrahmanhr.peel",
+  "name": "Peel",
+  "version": "0.1.0",
+  "author": "Abdulrahman Rahmouni",
+  "license": "MIT",
+  "description": "Drag a file, tap a key, drop it on the wheel that opens at the cursor: Peel converts images, audio, video, documents, spreadsheets, slides, PDFs and archives offline, next to the original, and offers Tools (compress, remove info, rotate, merge PDFs...) and Actions (copy path, terminal, LocalSend...). Inspired by Tangerine for macOS; not affiliated.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Peel",
+    "description": "Conversions in progress, and which key opens each wheel while you drag a file.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "homepage": "https://github.com/AbdulrahmanHR/omarchy-peel"
+}

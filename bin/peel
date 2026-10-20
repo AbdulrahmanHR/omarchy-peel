@@ -1,0 +1,1104 @@
+#!/usr/bin/env python3
+"""Peel: convert files offline with the tools already on the system.
+
+    peel targets [--json] FILE...            what FILE... can be converted to
+    peel convert --to EXT [--progress] [--notify] FILE...
+
+FILE may be a path or a file:// URI (what a drag and drop hands over).
+Output is a new file next to each input, never an overwrite: photo.png
+becomes photo.webp, or "photo (1).webp" when that name is taken.
+
+Every command is an argv list, filenames never reach a shell, and the
+converters never see a filename they could reinterpret: ImageMagick and
+rsvg-convert read stdin and write stdout, ffmpeg gets explicit file: URLs
+restricted to the file protocol. Documents go through LibreOffice (one
+private profile and temp directory per job, input passed as an absolute
+path) or pandoc, PDFs through poppler, archives are unpacked into a
+private temp directory, checked for escapes, and packed again.
+"""
+
+import json
+import lzma
+import os
+import re
+import secrets
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.parse
+import zipfile
+import zlib
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+REGISTRY = json.loads((ROOT / "registry" / "formats.json").read_text())
+FORMATS = REGISTRY["formats"]
+KINDS = REGISTRY["kinds"]
+
+# Extension (aliases included) -> canonical format key.
+EXT_INDEX = {}
+MIME_INDEX = {}
+for key, fmt in FORMATS.items():
+    EXT_INDEX[key] = key
+    for alias in fmt.get("aliases", []):
+        EXT_INDEX[alias] = key
+    for mime in fmt.get("mime", []):
+        MIME_INDEX.setdefault(mime, key)
+# Multi-dot extensions (tar.gz) are matched against the whole file name.
+MULTI_EXTS = sorted((e for e in EXT_INDEX if "." in e), key=len, reverse=True)
+
+# Per-job ceilings, so one hostile or huge input cannot take the session down.
+MEMORY_MAX = "4G"
+TIMEOUT_SECONDS = {"magick": 600, "rsvg": 300, "ffmpeg": 4 * 3600, "soffice": 900,
+                   "pandoc": 300, "poppler": 900, "pdf2docx": 900, "archive": 3600}
+
+# Executables each engine needs; a target is only offered when they exist.
+# (The archive engine decides per pair, see archive_tools.)
+ENGINE_TOOLS = {"magick": ["magick"], "rsvg": ["rsvg-convert"], "ffmpeg": ["ffmpeg", "ffprobe"],
+                "soffice": ["soffice"], "soffice-raster": ["soffice", "pdftoppm"],
+                "pandoc": ["pandoc"], "poppler-raster": ["pdftoppm"], "poppler-text": ["pdftotext"], "pdf2docx": ["pdf2docx"]}
+SEVENZ_INPUTS = ("7z", "rar")
+
+# Archive bomb limits: total unpacked size may not exceed min(half the free
+# space where the work happens, max(RATIO x archive size, ALLOWANCE)).
+ARCHIVE_MAX_ENTRIES = 100000
+ARCHIVE_RATIO = 200
+ARCHIVE_ALLOWANCE = 1 << 30
+
+# ffprobe format names of demuxers that open other files or URLs named inside
+# the input (playlists, concat scripts, device and network inputs).
+UNSAFE_DEMUXERS = {"concat", "hls", "applehttp", "dash", "m3u8", "ffmetadata", "tee",
+                   "image2", "lavfi", "sdp", "rtp", "rtsp"}
+
+
+class PeelError(Exception):
+    pass
+
+
+# --------------------------------------------------------------- inputs
+
+def to_path(arg):
+    if arg.startswith("file://"):
+        parsed = urllib.parse.urlparse(arg)
+        if parsed.netloc not in ("", "localhost"):
+            raise PeelError(f"not a local file: {arg}")
+        arg = urllib.parse.unquote(parsed.path)
+    # Validate the file the path leads to, but keep the path as given: the
+    # output lands beside a symlink, not beside the symlink's target.
+    path = Path(arg).expanduser().absolute()
+    if not path.resolve().is_file():
+        raise PeelError(f"not a file: {path}")
+    return path
+
+
+def multi_ext(path):
+    name = path.name.lower()
+    for ext in MULTI_EXTS:
+        if name.endswith("." + ext) and len(name) > len(ext) + 1:
+            return ext
+    return None
+
+
+def stem_of(path):
+    """File name without its extension, both dots of .tar.gz included."""
+    ext = multi_ext(path)
+    return path.name[:-(len(ext) + 1)] if ext else path.stem
+
+
+def detect_format(path):
+    ext = multi_ext(path)
+    if ext:
+        return EXT_INDEX[ext]
+    key = EXT_INDEX.get(path.suffix.lower().lstrip("."))
+    if key:
+        return key
+    try:
+        mime = subprocess.run(["file", "-b", "--mime-type", "--", str(path)],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return MIME_INDEX.get(mime)
+
+
+def archive_tools(src_key, out_key):
+    """Tools needed for one archive repack: any of the readers, one writer."""
+    reader = [["bsdtar"]] + ([["7z"]] if src_key in SEVENZ_INPUTS else [])
+    return reader, ["7z"] if out_key == "7z" else ["bsdtar"]
+
+
+def route_available(route, src_key, out_key):
+    if route["engine"] == "archive":
+        readers, writer = archive_tools(src_key, out_key)
+        return (any(all(shutil.which(t) for t in r) for r in readers)
+                and all(shutil.which(t) for t in writer))
+    return all(shutil.which(t) for t in ENGINE_TOOLS[route["engine"]])
+
+
+def routes_for(kind):
+    spec = KINDS[kind]
+    return spec.get("routes") or [{"engine": spec["engine"], "outputs": spec["outputs"]}]
+
+
+def find_route(src_key, out_key):
+    """First route (engine) of the source's kinds that can make out_key
+    and whose tools are installed, or None."""
+    for kind in FORMATS[src_key]["kinds"]:
+        for route in routes_for(kind):
+            if "inputs" in route and src_key not in route["inputs"]:
+                continue
+            if out_key in route["outputs"] and route_available(route, src_key, out_key):
+                return route
+    return None
+
+
+def targets_for(key):
+    """Ordered output formats one input format can be converted to."""
+    fmt = FORMATS[key]
+    seen = []
+    for kind in fmt["kinds"]:
+        for out in KINDS[kind]["outputs"]:
+            if out == key or out in seen:
+                continue
+            if fmt.get("silent") and FORMATS[out].get("audioOnly"):
+                continue
+            if not find_route(key, out):
+                continue
+            seen.append(out)
+    return seen
+
+
+def engine_for(src_key, out_key):
+    route = find_route(src_key, out_key)
+    if not route:
+        raise PeelError(f"cannot convert {FORMATS[src_key]['label']} to {FORMATS[out_key]['label']}")
+    return route["engine"]
+
+
+def common_targets(keys):
+    """Targets valid for every input; a target is dropped only when every
+    input already has that format (mixed batches skip those files instead)."""
+    lists = [targets_for(k) + [k] for k in keys]
+    common = [t for t in lists[0] if all(t in other for other in lists[1:])]
+    return [t for t in common if not all(k == t for k in keys)]
+
+
+# --------------------------------------------------------------- outputs
+
+def free_name(directory, stem, ext):
+    candidate = directory / f"{stem}.{ext}"
+    n = 1
+    while os.path.lexists(candidate):  # lexists: a dangling symlink still takes the name
+        candidate = directory / f"{stem} ({n}).{ext}"
+        n += 1
+    return candidate
+
+
+def publish(tmp, directory, stem, ext):
+    """Move tmp to the first free name without ever replacing a file."""
+    while True:
+        final = free_name(directory, stem, ext)
+        try:
+            os.link(tmp, final)
+        except FileExistsError:
+            continue  # someone took the name between the check and the link
+        except OSError:
+            # Filesystems without hard links (vfat, exfat): check, then rename.
+            if os.path.lexists(final):
+                continue
+            os.rename(tmp, final)
+            return final
+        os.unlink(tmp)
+        return final
+
+
+# --------------------------------------------------------------- running
+
+def limited(argv):
+    """Run argv inside a transient user scope with a memory ceiling."""
+    if shutil.which("systemd-run"):
+        return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                "-p", f"MemoryMax={MEMORY_MAX}", "-p", "MemorySwapMax=0", "--"] + argv
+    return argv
+
+
+def run(argv, timeout, stdin=None, stdout=None, on_line=None, cwd=None):
+    text = {"text": True, "errors": "replace"} if on_line else {}
+    proc = subprocess.Popen(limited(argv), stdin=stdin or subprocess.DEVNULL,
+                            stdout=stdout or (subprocess.PIPE if on_line else subprocess.DEVNULL),
+                            stderr=subprocess.PIPE, cwd=cwd, start_new_session=True, **text)
+    try:
+        if on_line:
+            for line in proc.stdout:
+                on_line(line.rstrip("\n"))
+        _, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        raise PeelError("timed out")
+    if proc.returncode != 0:
+        err = err if isinstance(err, str) else err.decode(errors="replace")
+        raise PeelError(last_line(err) or f"{argv[0]} exited with {proc.returncode}")
+
+
+def last_line(text):
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    return lines[-1][:300] if lines else ""
+
+
+def magick_quality(out_fmt, quality):
+    """-quality value for a lossy image format, [] for the rest."""
+    mode = out_fmt.get("quality")
+    if mode == "avif":
+        # AVIF's quality scale is stricter than JPEG's: the same number looks
+        # worse, so shift it down by 25 (balanced 85 -> 60, the old default).
+        return ["-quality", str(max(1, quality - 25))]
+    if mode:
+        return ["-quality", str(quality)]
+    return []
+
+
+def convert_magick(src, src_key, out_key, tmp, settings):
+    src_fmt, out_fmt = FORMATS[src_key], FORMATS[out_key]
+    argv = ["magick", f"{src_fmt['coder']}:-", "-auto-orient"]
+    if src_fmt.get("multiframe") and not out_fmt.get("multiframe"):
+        argv += ["-delete", "1--1"]  # single-frame target: keep the first frame
+    side = settings["image.maxSide"]
+    if side:
+        argv += ["-resize", f"{side}x{side}>"]  # only ever shrinks
+    if not settings["metadata.keep"]:
+        argv.append("-strip")
+    argv += magick_quality(out_fmt, settings["image.quality"]) + out_fmt.get("args", []) + [f"{out_fmt['coder']}:-"]
+    with open(src, "rb") as fin, open(tmp, "wb") as fout:
+        run(argv, TIMEOUT_SECONDS["magick"], stdin=fin, stdout=fout)
+
+
+def convert_rsvg(src, src_key, out_key, tmp, settings):
+    # PDF stays vector. A PNG at natural size is final unless it must shrink
+    # or lose metadata; everything else goes through ImageMagick afterwards.
+    direct = out_key == "pdf" or (out_key == "png" and not settings["image.maxSide"])
+    if direct:
+        with open(src, "rb") as fin, open(tmp, "wb") as fout:
+            run(["rsvg-convert", "-f", out_key], TIMEOUT_SECONDS["rsvg"], stdin=fin, stdout=fout)
+        return
+    png = tmp.with_name(tmp.name + ".png")
+    try:
+        with open(src, "rb") as fin, open(png, "wb") as fout:
+            run(["rsvg-convert", "-f", "png"], TIMEOUT_SECONDS["rsvg"], stdin=fin, stdout=fout)
+        convert_magick(png, "png", out_key, tmp, settings)
+    finally:
+        png.unlink(missing_ok=True)
+
+
+def probe_duration(src):
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-protocol_whitelist", "file",
+                              "-show_entries", "format=duration", "-of", "csv=p=0",
+                              f"file:{src}"], capture_output=True, text=True, timeout=30).stdout
+        return float(out.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+def codec_of(args, flag):
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+def crf_to_qscale(crf):
+    """x264 CRF -> -q:v for mpeg4/wmv2: 18 -> 2, 23 -> 3, 28 -> 5, clamped to 2..10."""
+    points = [(18, 2), (23, 3), (28, 5), (40, 11)]
+    if crf <= points[0][0]:
+        return points[0][1]
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        if crf <= x1:
+            return max(2, min(10, round(y0 + (y1 - y0) * (crf - x0) / (x1 - x0))))
+    return 10
+
+
+def video_filter(max_height):
+    """Even dimensions, and height <= max_height (aspect kept, never upscaled)."""
+    if not max_height:
+        return "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+    return (f"scale='trunc(iw*min(1,{max_height}/ih)/2)*2':'trunc(min(ih,{max_height})/2)*2'")
+
+
+def ffmpeg_args(out_key, settings):
+    """Encoder arguments for out_key with the quality settings applied."""
+    base = list(FORMATS[out_key]["ffmpeg"])
+    extra = []
+    vcodec, acodec = codec_of(base, "-c:v"), codec_of(base, "-c:a")
+    if vcodec:
+        crf = settings["video.crf"]
+        extra += ["-vf", video_filter(settings["video.maxHeight"])]
+        if vcodec == "libx264":
+            extra += ["-crf", str(crf), "-preset", settings["video.speed"]]
+        elif vcodec == "libvpx-vp9":
+            extra += ["-crf", str(crf + 9)]  # VP9's CRF scale runs higher for the same look
+        else:  # mpeg4, wmv2
+            extra += ["-q:v", str(crf_to_qscale(crf))]
+    if acodec in ("aac", "libopus", "libvorbis", "wmav2", "libmp3lame"):
+        extra += ["-b:a", f"{settings['audio.bitrate']}k"]
+    return base + extra
+
+
+def gif_args(settings):
+    width = settings["gif.width"]
+    scale = f",scale='min({width},iw)':-1:flags=lanczos" if width else ""
+    chain = REGISTRY["gif"]["filter"].format(fps=settings["gif.fps"], scale=scale)
+    return ["-an", "-filter_complex", chain, "-loop", "0"]
+
+
+def check_demuxer(src, is_image=False):
+    """Refuse inputs whose real container format can reference other files.
+
+    The file name says nothing: clip.mp4 may hold an ffconcat script."""
+    try:
+        proc = subprocess.run(["ffprobe", "-v", "error", "-protocol_whitelist", "file",
+                               "-show_entries", "format=format_name", "-of", "csv=p=0", f"file:{src}"],
+                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        raise PeelError("cannot identify the media format")
+    names = {n.strip() for n in proc.stdout.strip().split(",") if n.strip()}
+    if proc.returncode != 0 or not names:
+        raise PeelError("cannot identify the media format")
+    bad = names & (UNSAFE_DEMUXERS - ({"image2"} if is_image else set()))
+    if bad:
+        raise PeelError(f"unsafe media container ({', '.join(sorted(bad))}); refusing to convert")
+
+
+def convert_ffmpeg(src, src_key, out_key, tmp, report, settings):
+    out_fmt = FORMATS[out_key]
+    check_demuxer(src, "image" in FORMATS[src_key]["kinds"])
+    meta = "0" if settings["metadata.keep"] else "-1"
+    argv = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-protocol_whitelist", "file,pipe", "-i", f"file:{src}", "-map_metadata", meta, "-sn", "-dn"]
+    if out_key == "gif":
+        argv += gif_args(settings)
+    elif out_fmt.get("audioOnly"):
+        argv += ["-vn"] + ffmpeg_args(out_key, settings)
+    else:
+        argv += ffmpeg_args(out_key, settings)
+    argv += ["-progress", "pipe:1", "-nostats", "-f", ffmpeg_muxer(out_key), f"file:{tmp}"]
+
+    duration = probe_duration(src)
+
+    def on_line(line):
+        if duration > 0 and line.startswith("out_time_us="):
+            try:
+                report(min(99.0, int(line.split("=", 1)[1]) / 1e6 / duration * 100))
+            except ValueError:
+                pass
+
+    run(argv, TIMEOUT_SECONDS["ffmpeg"], on_line=on_line)
+
+
+def ffmpeg_muxer(key):
+    # The temp file's name is not trusted to pick the muxer.
+    return {"m4a": "ipod", "mkv": "matroska", "aiff": "aiff", "wma": "asf",
+            "wmv": "asf", "ogg": "ogg", "opus": "opus", "mp3": "mp3"}.get(key, key)
+
+
+def file_url(path):
+    return "file://" + urllib.parse.quote(str(path))
+
+
+MACRO_LOCKDOWN_XCU = """<?xml version="1.0" encoding="UTF-8"?>
+<oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
+</oor:items>
+"""
+
+
+def write_office_profile(profile):
+    """Seed a fresh LibreOffice profile with macros switched off (Very High)."""
+    user = profile / "user"
+    user.mkdir(parents=True, exist_ok=True)
+    (user / "registrymodifications.xcu").write_text(MACRO_LOCKDOWN_XCU, encoding="utf-8")
+
+
+def convert_soffice(src, src_key, out_key, work):
+    """LibreOffice headless into work/out; returns the produced file.
+
+    Each job gets its own profile (no lock contention between concurrent
+    jobs) and reads the source through a symlink with a fixed safe name,
+    so the file name never reaches LibreOffice's option or filter parsing."""
+    profile, outdir, indir = work / "profile", work / "out", work / "in"
+    for d in (profile, outdir, indir):
+        d.mkdir()
+    write_office_profile(profile)
+    link = indir / f"input.{src_key}"
+    link.symlink_to(src)
+    argv = ["soffice", "--headless", "--norestore", f"-env:UserInstallation={file_url(profile)}"]
+    infilter = FORMATS[src_key].get("infilter")
+    if infilter:
+        argv.append(f"--infilter={infilter}")
+    argv += ["--convert-to", FORMATS[out_key]["soffice"] if "soffice" in FORMATS[out_key] else out_key,
+             "--outdir", str(outdir), str(link)]
+    run(argv, TIMEOUT_SECONDS["soffice"])
+    result = outdir / f"input.{out_key}"
+    if not result.is_file():
+        raise PeelError("LibreOffice could not convert this file")
+    if out_key == "txt":  # LibreOffice writes a UTF-8 byte order mark
+        data = result.read_bytes()
+        if data.startswith(b"\xef\xbb\xbf"):
+            result.write_bytes(data[3:])
+    return result
+
+
+PANDOC_IN = {"md": "markdown", "txt": "markdown", "docx": "docx", "odt": "odt",
+             "rtf": "rtf", "html": "html", "epub": "epub"}
+PANDOC_OUT = {"md": "markdown", "txt": "plain", "docx": "docx", "odt": "odt",
+              "html": "html", "epub": "epub"}
+
+
+def convert_pandoc(src, src_key, out_key, tmp):
+    argv = ["pandoc", "--sandbox", "-f", PANDOC_IN[src_key], "-t", PANDOC_OUT[out_key]]
+    if out_key == "html":
+        argv.append("-s")
+    run(argv + ["-o", str(tmp), str(src)], TIMEOUT_SECONDS["pandoc"])
+
+
+def rasterise(pdf, out_key, dpi, work):  # dpi: settings["pdf.dpi"]
+    """pdf -> one image per page via pdftoppm; returns the files in page order."""
+    prefix = work / "page"
+    flag = "-png" if out_key == "png" else "-jpeg"
+    run(["pdftoppm", flag, "-r", str(dpi), str(pdf), str(prefix)], TIMEOUT_SECONDS["poppler"])
+    pages = []
+    for f in work.iterdir():
+        m = re.fullmatch(r"page-(\d+)\." + ("png" if out_key == "png" else "jpg"), f.name)
+        if m:
+            pages.append((int(m.group(1)), f))
+    if not pages:
+        raise PeelError("converter produced no output")
+    return [f for _, f in sorted(pages)]
+
+
+def convert_pdf2docx(src, work):
+    """PDF -> DOCX with the external pdf2docx CLI (python-fire based, so file
+    names are never passed: both ends are fixed names inside the work dir)."""
+    link, result = work / "input.pdf", work / "out.docx"
+    link.symlink_to(src)
+    run(["pdf2docx", "convert", str(link), str(result)], TIMEOUT_SECONDS["pdf2docx"], cwd=work)
+    try:
+        if result.stat().st_size == 0:
+            raise ValueError
+        with zipfile.ZipFile(result) as z:
+            z.getinfo("word/document.xml")
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile):
+        raise PeelError("pdf2docx produced no output \u2014 scanned PDFs have no text to convert")
+    return result
+
+
+def pdf_to_text(src, tmp):
+    run(["pdftotext", "-layout", "-enc", "UTF-8", str(src), str(tmp)], TIMEOUT_SECONDS["poppler"])
+
+
+# ----------------------------------------------------------- archives
+
+def archive_names_ok(names):
+    for name in names:
+        parts = re.split(r"[/\\]", name)
+        if name.startswith(("/", "\\")) or ".." in parts or re.match(r"^[A-Za-z]:", name):
+            raise PeelError(f"archive entry would escape the target directory: {name[:80]}")
+
+
+def list_archive(src, tool):
+    names = []
+    if tool == "bsdtar":
+        run(["bsdtar", "-tf", str(src)], TIMEOUT_SECONDS["archive"], on_line=names.append)
+    else:
+        lines = []
+        run(["7z", "l", "-ba", "-slt", "-spd", "--", str(src)], TIMEOUT_SECONDS["archive"], on_line=lines.append)
+        for line in lines:
+            if line.startswith("Path = "):
+                names.append(line[len("Path = "):])
+            elif line.startswith("Attributes = ") and re.search("[lL]", line):
+                raise PeelError("archive contains links")
+    archive_names_ok([n for n in names if n])
+    return names
+
+
+def verify_tree(root):
+    """Refuse anything extracted that could point or reach outside root."""
+    real_root = Path(os.path.realpath(root))
+    for dirpath, dirs, files in os.walk(root, followlinks=False):
+        for name in dirs + files:
+            path = Path(dirpath) / name
+            mode = path.lstat()
+            if stat.S_ISLNK(mode.st_mode):
+                target = Path(os.path.realpath(path))
+                if target != real_root and real_root not in target.parents:
+                    raise PeelError("archive contains a link that points outside it")
+            elif stat.S_ISDIR(mode.st_mode):
+                continue
+            elif not stat.S_ISREG(mode.st_mode) or mode.st_nlink > 1:
+                raise PeelError("archive contains special files or hard links")
+
+
+def measure_archive(src, src_key, limit):
+    """(entry count, total unpacked bytes) from the archive's own index,
+    refusing as soon as either exceeds its limit. Nothing is extracted."""
+    count = total = 0
+
+    def add(size):
+        nonlocal count, total
+        count += 1
+        total += max(0, size or 0)
+        if count > ARCHIVE_MAX_ENTRIES:
+            raise PeelError(f"archive has too many entries (more than {ARCHIVE_MAX_ENTRIES})")
+        if total > limit:
+            raise PeelError(f"archive would unpack to more than {limit // (1 << 20)} MiB; refusing")
+
+    try:
+        if src_key in SEVENZ_INPUTS:
+            if not shutil.which("7z"):
+                raise PeelError("cannot check the unpacked size of this archive without 7z")
+            lines = []
+            run(["7z", "l", "-ba", "-slt", "-spd", "--", str(src)], TIMEOUT_SECONDS["archive"],
+                on_line=lines.append)
+            size = None
+            for line in lines + ["Path = "]:  # sentinel flushes the last entry
+                if line.startswith("Path = "):
+                    if size is not None:
+                        add(size)
+                    size = 0
+                elif line.startswith("Size = ") and size is not None:
+                    size = int(line[len("Size = "):].strip() or 0)
+        elif src_key == "zip":
+            with zipfile.ZipFile(src) as z:
+                for info in z.infolist():
+                    add(info.file_size)
+        else:
+            with tarfile.open(src, "r:*") as tar:
+                for member in tar:
+                    add(member.size if member.isfile() else 0)
+    except PeelError:
+        raise
+    except (zipfile.BadZipFile, tarfile.TarError, OSError, EOFError, ValueError,
+            zlib.error, lzma.LZMAError, NotImplementedError):
+        raise PeelError("cannot read this archive")
+    return count, total
+
+
+def extract_archive(src, src_key, stage):
+    limit = min(shutil.disk_usage(stage).free // 2,
+                max(ARCHIVE_RATIO * src.stat().st_size, ARCHIVE_ALLOWANCE))
+    measure_archive(src, src_key, limit)
+    tools = ["bsdtar"] if shutil.which("bsdtar") else []
+    if src_key in SEVENZ_INPUTS and shutil.which("7z"):
+        tools.append("7z")
+    error = None
+    for tool in tools:
+        try:
+            list_archive(src, tool)
+            if tool == "bsdtar":
+                argv = ["bsdtar", "-xf", str(src), "-C", str(stage), "--no-same-owner",
+                        "--no-same-permissions", "--no-acls", "--no-xattrs"]
+            else:
+                argv = ["7z", "x", "-y", "-bd", "-spd", f"-o{stage}", "--", str(src)]
+            run(argv, TIMEOUT_SECONDS["archive"])
+            verify_tree(stage)
+            return
+        except PeelError as e:
+            error = e
+            for child in stage.iterdir():
+                if child.is_dir() and not child.is_symlink():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+    raise error or PeelError("no tool can read this archive")
+
+
+def pack_archive(stage, out_key, tmp):
+    entries = sorted(os.listdir(stage))
+    if not entries:
+        raise PeelError("archive is empty")
+    # A leading ./ keeps names that look like options (-x) or bsdtar's @archive syntax inert.
+    names = ["./" + n if n.startswith(("-", "@")) else n for n in entries]
+    if out_key == "7z":
+        run(["7z", "a", "-t7z", "-snl", "-bd", "-y", "-spd", str(tmp), "--"] + names,
+            TIMEOUT_SECONDS["archive"], cwd=stage)
+        return
+    fmt = {"zip": ["--format", "zip"], "tar": ["--format", "pax"],
+           "tar.gz": ["--format", "pax", "-z"]}[out_key]
+    run(["bsdtar", "-cf", str(tmp), "--no-xattrs", "--no-acls"] + fmt + ["-C", str(stage)] + names,
+        TIMEOUT_SECONDS["archive"])
+
+
+def convert_archive(src, src_key, out_key, work, tmp):
+    stage = work / "stage"
+    stage.mkdir()
+    extract_archive(src, src_key, stage)
+    pack_archive(stage, out_key, tmp)
+
+
+def convert_one(src, out_key, report, settings, outdir=None):
+    """Returns the list of published files (first is the primary), or None
+    when the input already has the target format."""
+    src_key = detect_format(src)
+    if not src_key:
+        raise PeelError("unsupported file type")
+    if src_key == out_key:
+        return None
+    if FORMATS[out_key].get("inputOnly") or out_key not in targets_for(src_key):
+        raise PeelError(f"cannot convert {FORMATS[src_key]['label']} to {FORMATS[out_key]['label']}")
+
+    engine = engine_for(src_key, out_key)
+    directory = outdir or src.parent
+    if not os.access(directory, os.W_OK):
+        raise PeelError(f"cannot write to {directory}")
+    stem = stem_of(src)
+    tmp = directory / f".{stem[:80]}.peel-{secrets.token_hex(4)}.{out_key.replace('.', '_')}"
+    work = None
+    try:
+        if engine in ("magick", "rsvg", "ffmpeg", "pandoc", "poppler-text"):
+            if engine == "magick":
+                convert_magick(src, src_key, out_key, tmp, settings)
+            elif engine == "rsvg":
+                convert_rsvg(src, src_key, out_key, tmp, settings)
+            elif engine == "pandoc":
+                convert_pandoc(src, src_key, out_key, tmp)
+            elif engine == "poppler-text":
+                pdf_to_text(src, tmp)
+            else:
+                convert_ffmpeg(src, src_key, out_key, tmp, report, settings)
+            return [publish_checked(tmp, directory, stem, out_key)]
+
+        work = Path(tempfile.mkdtemp(prefix=f".peel-work-{secrets.token_hex(2)}-", dir=directory))
+        if engine == "soffice":
+            produced = convert_soffice(src, src_key, out_key, work)
+            return [publish_checked(produced, directory, stem, out_key)]
+        if engine == "pdf2docx":
+            return [publish_checked(convert_pdf2docx(src, work), directory, stem, out_key)]
+        if engine == "archive":
+            convert_archive(src, src_key, out_key, work, tmp)
+            return [publish_checked(tmp, directory, stem, out_key)]
+        # Page images: from the PDF itself, or from the slides exported to PDF first.
+        if engine == "soffice-raster":
+            pdf = convert_soffice(src, src_key, "pdf", work)
+        else:
+            pdf = src
+        dpi = settings["pdf.dpi"]
+        raster_dir = work / "pages"
+        raster_dir.mkdir()
+        pages = rasterise(pdf, out_key, dpi, raster_dir)
+        outputs = []
+        for number, page in enumerate(pages, 1):
+            name = stem if len(pages) == 1 else f"{stem}-{number}"
+            outputs.append(publish_checked(page, directory, name, out_key))
+        return outputs
+    finally:
+        tmp.unlink(missing_ok=True)
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+def publish_checked(path, directory, stem, ext):
+    if not path.exists() or path.stat().st_size == 0:
+        raise PeelError("converter produced no output")
+    return publish(path, directory, stem, ext)
+
+
+# --------------------------------------------------------------- commands
+
+def emit(enabled, **event):
+    if enabled:
+        print(json.dumps(event), flush=True)
+
+
+def notify(title, body):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Peel", "--", title, body],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_targets(args, as_json):
+    keys = []
+    for arg in args:
+        key = detect_format(to_path(arg))
+        if not key:
+            raise PeelError(f"unsupported file type: {arg}")
+        keys.append(key)
+    targets = common_targets(keys)
+    if as_json:
+        print(json.dumps({"convert": [{"ext": t, "label": FORMATS[t]["label"]} for t in targets]}))
+    else:
+        print(" ".join(targets))
+
+
+def cmd_convert(out_key, args, progress, want_notify):
+    out_key = EXT_INDEX.get(out_key.lower().lstrip("."))
+    if not out_key or FORMATS[out_key].get("inputOnly"):
+        raise PeelError("unknown target format")
+
+    config = load_config()
+    settings = effective_settings(config)
+    outdir = None
+    if config["output"]["location"] == "folder":
+        folder = config["output"]["folder"]
+        if folder and os.path.isdir(folder) and os.access(folder, os.W_OK | os.X_OK):
+            outdir = Path(folder)
+        else:
+            message = (f"output folder {folder} is missing or not writable; "
+                       "saving next to the originals instead" if folder else
+                       "no output folder is set; saving next to the originals instead")
+            if progress:
+                emit(progress, event="warning", message=message)
+            else:
+                print(f"peel: {message}", file=sys.stderr)
+
+    outputs, failures, skipped = [], [], 0
+    total = len(args)
+    for index, arg in enumerate(args):
+        try:
+            src = to_path(arg)
+        except PeelError as error:
+            failures.append((arg, str(error)))
+            emit(progress, event="error", index=index, file=arg, message=str(error))
+            continue
+        emit(progress, event="start", index=index, total=total, file=str(src))
+        try:
+            result = convert_one(src, out_key,
+                                 lambda pct: emit(progress, event="progress", index=index, pct=round(pct, 1)),
+                                 settings, outdir)
+        except PeelError as error:
+            failures.append((str(src), str(error)))
+            emit(progress, event="error", index=index, file=str(src), message=str(error))
+            continue
+        if result is None:
+            skipped += 1
+            emit(progress, event="skipped", index=index, file=str(src))
+        else:
+            outputs.extend(result)
+            emit(progress, event="done", index=index, file=str(src), output=str(result[0]),
+                 outputs=[str(r) for r in result])
+            if not progress:
+                for r in result:
+                    print(r)
+
+    emit(progress, event="finished", ok=len(outputs), failed=len(failures), skipped=skipped)
+    for src, message in failures:
+        print(f"peel: {Path(src).name}: {message}", file=sys.stderr)
+
+    if want_notify:
+        label = FORMATS[out_key]["label"]
+        if failures and not outputs:
+            notify(f"Could not convert to {label}", failures[0][1])
+        elif failures:
+            notify(f"Converted {len(outputs)} of {total} to {label}", f"{len(failures)} failed: {failures[0][1]}")
+        elif outputs:
+            body = outputs[0].name if len(outputs) == 1 else f"{len(outputs)} files in {outputs[0].parent}"
+            notify(f"Converted to {label}", body)
+    return 1 if failures else 0
+
+
+WHEELS = ("convert", "tools", "actions")
+DEFAULT_KEYS = {"convert": "Shift_L", "tools": "Control_L", "actions": "Alt_L"}
+ALLOWED_KEYS = ["Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R", "Super_L", "Super_R", "off"]
+
+QUALITIES = [
+    {"id": "high", "label": "High", "description": "Best quality, bigger files"},
+    {"id": "balanced", "label": "Balanced", "description": "Good quality, sensible size"},
+    {"id": "small", "label": "Small", "description": "Smaller files for sharing"},
+]
+QUALITY_IDS = [q["id"] for q in QUALITIES]
+OUTPUT_LOCATIONS = [{"value": "beside", "label": "Next to original"}, {"value": "folder", "label": "Folder"}]
+
+
+def _choices(values, label):
+    return [{"value": v, "label": label(v)} for v in values]
+
+
+def _field(key, group, label, kind, high, balanced, small, **extra):
+    return {"key": key, "group": group, "label": label, "type": kind, **extra,
+            "presets": {"high": high, "balanced": balanced, "small": small}}
+
+
+def _orig(unit):
+    return lambda v: "Original" if v == 0 else f"{v}{unit}"
+
+
+ADVANCED_FIELDS = [
+    _field("image.quality", "Images", "Quality", "integer", 92, 85, 70, min=1, max=100, step=5, unit=""),
+    _field("image.maxSide", "Images", "Max size", "enum", 0, 0, 2560,
+           choices=_choices([0, 3840, 2560, 1920, 1280], _orig(" px"))),
+    _field("video.crf", "Video", "Quality (CRF, lower is better)", "integer", 18, 23, 28,
+           min=14, max=40, step=1, unit=""),
+    _field("video.maxHeight", "Video", "Max resolution", "enum", 0, 0, 1080,
+           choices=[{"value": 0, "label": "Original"}, {"value": 2160, "label": "4K"},
+                    {"value": 1440, "label": "1440p"}, {"value": 1080, "label": "1080p"},
+                    {"value": 720, "label": "720p"}, {"value": 480, "label": "480p"}]),
+    _field("video.speed", "Video", "Encoding speed", "enum", "slow", "medium", "faster",
+           choices=[{"value": "veryfast", "label": "Very fast"}, {"value": "faster", "label": "Faster"},
+                    {"value": "medium", "label": "Medium"}, {"value": "slow", "label": "Slow"},
+                    {"value": "slower", "label": "Slower"}]),
+    _field("audio.bitrate", "Audio", "Bitrate", "enum", 256, 192, 128,
+           choices=_choices([96, 128, 160, 192, 256, 320], lambda v: f"{v} kbps")),
+    _field("gif.fps", "GIF", "Frame rate", "integer", 15, 12, 10, min=5, max=30, step=1, unit="fps"),
+    _field("gif.width", "GIF", "Width", "enum", 960, 720, 480,
+           choices=_choices([0, 1280, 960, 720, 480, 320], _orig(" px"))),
+    _field("pdf.dpi", "PDF", "Page image resolution", "enum", 300, 300, 150,
+           choices=_choices([72, 150, 200, 300, 600], lambda v: f"{v} dpi")),
+    _field("metadata.keep", "General", "Keep metadata", "boolean", True, True, False),
+]
+FIELD_BY_KEY = {f["key"]: f for f in ADVANCED_FIELDS}
+
+
+def config_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return Path(base) / "peel" / "config.json"
+
+
+def default_config():
+    return {"version": 1, "keys": dict(DEFAULT_KEYS), "quality": "balanced",
+            "output": {"location": "beside", "folder": ""}, "advanced": {}}
+
+
+def check_keys(keys):
+    """Raise PeelError if keys is not a valid wheel -> key mapping."""
+    for wheel, value in keys.items():
+        if wheel not in WHEELS:
+            raise PeelError(f"unknown wheel '{wheel}' (expected one of: {', '.join(WHEELS)})")
+        if value not in ALLOWED_KEYS:
+            raise PeelError(f"'{value}' is not an allowed key for {wheel} (allowed: {', '.join(ALLOWED_KEYS)})")
+    for wheel, value in keys.items():
+        if value == "off":
+            continue
+        for other in WHEELS:
+            if other != wheel and keys.get(other) == value:
+                raise PeelError(f"{wheel}: key {value} is already used by {other}")
+
+
+def check_value(field, value):
+    """Validate a stored (already typed) value for field; returns it or raises PeelError."""
+    key, kind = field["key"], field["type"]
+    if kind == "boolean":
+        if not isinstance(value, bool):
+            raise PeelError(f"{key} must be true or false")
+    elif kind == "integer":
+        if isinstance(value, bool) or not isinstance(value, int) or not field["min"] <= value <= field["max"]:
+            raise PeelError(f"{key} must be an integer from {field['min']} to {field['max']}")
+    else:
+        allowed = [c["value"] for c in field["choices"]]
+        if isinstance(value, bool) or value not in allowed or type(value) is not type(allowed[0]):
+            raise PeelError(f"{key} must be one of: {', '.join(str(a) for a in allowed)}")
+    return value
+
+
+def parse_value(field, text):
+    """Turn command line text into a typed value for field, validated."""
+    kind = field["type"]
+    if kind == "boolean":
+        if text not in ("true", "false"):
+            raise PeelError(f"{field['key']} must be true or false")
+        return text == "true"
+    if kind == "integer":
+        if not re.fullmatch(r"-?\d+", text):
+            raise PeelError(f"{field['key']} must be an integer from {field['min']} to {field['max']}")
+        return check_value(field, int(text))
+    for choice in field["choices"]:
+        if str(choice["value"]) == text:
+            return choice["value"]
+    raise PeelError(f"{field['key']} must be one of: {', '.join(str(c['value']) for c in field['choices'])}")
+
+
+def warn_config(path, message):
+    print(f"peel: invalid config {path}: {message}; ignoring it", file=sys.stderr)
+
+
+def load_config():
+    """Merged config; bad parts (plus a stderr warning each) fall back to defaults."""
+    path = config_path()
+    config = default_config()
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
+        return config
+    except OSError as error:
+        print(f"peel: cannot read {path}: {error}; using defaults", file=sys.stderr)
+        return config
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise PeelError("top level must be an object")
+    except (ValueError, PeelError) as error:
+        print(f"peel: invalid config {path}: {error}; using defaults", file=sys.stderr)
+        return config
+
+    try:
+        given = data.get("keys", {})
+        if not isinstance(given, dict):
+            raise PeelError("'keys' must be an object")
+        merged = {**DEFAULT_KEYS, **given}
+        check_keys(merged)
+        config["keys"] = merged
+    except PeelError as error:
+        print(f"peel: invalid config {path}: {error}; using defaults", file=sys.stderr)
+
+    if "quality" in data:
+        if data["quality"] in QUALITY_IDS:
+            config["quality"] = data["quality"]
+        else:
+            warn_config(path, f"'quality' must be one of: {', '.join(QUALITY_IDS)}")
+
+    output = data.get("output", {})
+    if not isinstance(output, dict):
+        warn_config(path, "'output' must be an object")
+        output = {}
+    if "location" in output:
+        if output["location"] in [o["value"] for o in OUTPUT_LOCATIONS]:
+            config["output"]["location"] = output["location"]
+        else:
+            warn_config(path, "'output.location' must be beside or folder")
+    if "folder" in output:
+        if isinstance(output["folder"], str):
+            config["output"]["folder"] = output["folder"]
+        else:
+            warn_config(path, "'output.folder' must be a string")
+
+    advanced = data.get("advanced", {})
+    if not isinstance(advanced, dict):
+        warn_config(path, "'advanced' must be an object")
+        advanced = {}
+    for key, value in advanced.items():
+        field = FIELD_BY_KEY.get(key)
+        if not field:
+            warn_config(path, f"unknown advanced setting '{key}'")
+            continue
+        try:
+            config["advanced"][key] = check_value(field, value)
+        except PeelError as error:
+            warn_config(path, str(error))
+    return config
+
+
+def effective_settings(config):
+    """Every field's value: the override, else the chosen preset's."""
+    return {f["key"]: config["advanced"].get(f["key"], f["presets"][config["quality"]])
+            for f in ADVANCED_FIELDS}
+
+
+def write_config(config):
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".config-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(config, fh, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+SET_USAGE = ("usage: peel config set NAME VALUE (NAME: keys.<wheel>, quality, "
+             "advanced.<field>, output.location, output.folder)")
+
+
+def apply_setting(config, target, value):
+    """Return config with one setting changed, or raise PeelError."""
+    section, _, rest = target.partition(".")
+    if target == "quality":
+        if value not in QUALITY_IDS:
+            raise PeelError(f"quality must be one of: {', '.join(QUALITY_IDS)}")
+        config["quality"] = value
+    elif section == "keys" and rest:
+        config["keys"] = {**config["keys"], rest: value}
+        check_keys(config["keys"])
+    elif section == "advanced" and rest:
+        field = FIELD_BY_KEY.get(rest)
+        if not field:
+            raise PeelError(f"unknown advanced setting '{rest}' (expected one of: {', '.join(FIELD_BY_KEY)})")
+        if value == "default":
+            config["advanced"].pop(rest, None)
+        else:
+            config["advanced"][rest] = parse_value(field, value)
+    elif target == "output.location":
+        if value not in [o["value"] for o in OUTPUT_LOCATIONS]:
+            raise PeelError("output.location must be beside or folder")
+        config["output"]["location"] = value
+    elif target == "output.folder":
+        if not os.path.isabs(value):
+            raise PeelError("output.folder must be an absolute path")
+        if not os.path.isdir(value):
+            raise PeelError(f"output.folder: {value} is not an existing directory")
+        if not os.access(value, os.W_OK | os.X_OK):
+            raise PeelError(f"output.folder: {value} is not writable")
+        config["output"]["folder"] = value
+    else:
+        raise PeelError(f"unknown setting '{target}'")
+    return config
+
+
+def cmd_config(rest, as_json):
+    if rest and rest[0] == "set":
+        if len(rest) != 3:
+            raise PeelError(SET_USAGE)
+        write_config(apply_setting(load_config(), rest[1], rest[2]))
+        return 0
+    if rest:
+        raise PeelError(f"unknown config action '{rest[0]}'")
+    config = load_config()
+    effective = effective_settings(config)
+    if as_json:
+        print(json.dumps({
+            "config": config, "effective": effective,
+            "options": {"keys": ALLOWED_KEYS, "quality": QUALITIES, "advanced": ADVANCED_FIELDS,
+                        "output": {"location": OUTPUT_LOCATIONS}},
+            "path": str(config_path())}))
+    else:
+        for wheel in WHEELS:
+            print(f"keys.{wheel} = {config['keys'][wheel]}")
+        print(f"quality = {config['quality']}")
+        print(f"output.location = {config['output']['location']}")
+        print(f"output.folder = {config['output']['folder']}")
+        for key, value in effective.items():
+            mark = "" if key in config["advanced"] else " (preset)"
+            print(f"advanced.{key} = {json.dumps(value)}{mark}")
+    return 0
+
+
+def parser():
+    import argparse
+    p = argparse.ArgumentParser(prog="peel", description="Convert files offline.")
+    sub = p.add_subparsers(dest="command", required=True)
+    t = sub.add_parser("targets", help="list what FILE... can be converted to")
+    t.add_argument("--json", action="store_true")
+    t.add_argument("files", nargs="+", metavar="FILE")
+    c = sub.add_parser("convert", help="convert FILE... to another format")
+    c.add_argument("--to", required=True, metavar="EXT")
+    c.add_argument("--progress", action="store_true", help="print JSON progress events")
+    c.add_argument("--notify", action="store_true", help="send a desktop notification when done")
+    c.add_argument("files", nargs="+", metavar="FILE")
+    g = sub.add_parser("config", help="show or change settings (config set NAME VALUE)")
+    g.add_argument("--json", action="store_true")
+    g.add_argument("rest", nargs="*", metavar="set KEY VALUE")
+    return p
+
+
+def main(argv):
+    args = parser().parse_args(argv)
+    try:
+        if args.command == "targets":
+            cmd_targets(args.files, args.json)
+            return 0
+        if args.command == "config":
+            return cmd_config(args.rest, args.json)
+        return cmd_convert(args.to, args.files, args.progress, args.notify)
+    except PeelError as error:
+        print(f"peel: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

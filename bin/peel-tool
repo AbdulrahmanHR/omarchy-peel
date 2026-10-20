@@ -1,0 +1,625 @@
+#!/usr/bin/env python3
+"""Peel tools: one-click fixed-preset operations on files, offline.
+
+    peel-tool targets --json -- FILE...
+    peel-tool run --tool ID [--progress] [--notify] -- FILE...
+
+Output is always a new file next to the input ("photo (compressed).jpg",
+"photo (compressed) (1).jpg" when taken); the source is never touched.
+
+Same safety conventions as bin/peel: argv-only subprocesses inside a
+memory-limited systemd scope with timeouts, ImageMagick fed through
+stdin/stdout with explicit coders, ffmpeg given file: URLs restricted to the
+file protocol, work done in a temp file with a name no user input reaches.
+"""
+
+import json
+import os
+import secrets
+import shutil
+import signal
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+MEMORY_MAX = "4G"
+PEEL = Path(__file__).resolve().parent / "peel"
+# ffprobe format names of demuxers that open other files or URLs named inside
+# the input (playlists, concat scripts, device and network inputs).
+UNSAFE_DEMUXERS = {"concat", "hls", "applehttp", "dash", "m3u8", "ffmetadata", "tee",
+                   "image2", "lavfi", "sdp", "rtp", "rtsp"}
+TIMEOUT_SECONDS = {"magick": 600, "ffmpeg": 4 * 3600, "gs": 1800, "qpdf": 600}
+
+KIND_EXTS = {
+    "image": {"jpg", "jpeg", "png", "webp", "avif", "heic", "tiff", "bmp", "gif"},
+    "video": {"mp4", "mov", "mkv", "webm", "avi", "wmv", "m4v"},
+    "audio": {"mp3", "m4a", "wav", "flac", "ogg", "opus", "aiff", "wma"},
+    "pdf": {"pdf"},
+}
+EXT_KIND = {e: k for k, exts in KIND_EXTS.items() for e in exts}
+
+IMAGE_CODER = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP", "avif": "AVIF",
+               "heic": "HEIC", "tiff": "TIFF", "bmp": "BMP", "gif": "GIF"}
+MUXER = {"mp4": "mp4", "m4v": "mp4", "mov": "mov", "mkv": "matroska", "webm": "webm",
+         "avi": "avi", "wmv": "asf", "mp3": "mp3", "m4a": "ipod", "wav": "wav",
+         "flac": "flac", "ogg": "ogg", "opus": "opus", "aiff": "aiff", "wma": "asf",
+         "png": "image2"}
+
+# id -> label, accepted kinds, filename suffix, binaries needed (any group member).
+TOOLS = {
+    "compress": ("Compress", {"image", "video", "audio", "pdf"}, "compressed"),
+    "strip-metadata": ("Remove info", {"image", "video", "audio", "pdf"}, "no info"),
+    "resize-half": ("Half size", {"image", "video"}, "half"),
+    "rotate": ("Rotate", {"image", "video"}, "rotated"),
+    "to-grayscale": ("Grayscale", {"image"}, "gray"),
+    "trim-silence": ("Trim silence", {"audio"}, "trimmed"),
+    "extract-audio": ("Extract audio", {"video"}, None),
+    "snapshot": ("Snapshot", {"video"}, "frame"),
+    "merge-pdf": ("Merge PDFs", {"pdf"}, "merged"),
+    "split-pdf": ("Split pages", {"pdf"}, None),
+}
+ORDER = {
+    "image": ["compress", "resize-half", "strip-metadata", "rotate", "to-grayscale"],
+    "video": ["compress", "extract-audio", "snapshot", "resize-half", "strip-metadata", "rotate"],
+    "audio": ["compress", "trim-silence", "strip-metadata"],
+    "pdf": ["compress", "merge-pdf", "split-pdf", "strip-metadata"],
+}
+
+
+class ToolError(Exception):
+    pass
+
+
+class Skip(Exception):
+    pass
+
+
+# --------------------------------------------------------------- inputs
+
+def to_path(arg):
+    if arg.startswith("file://"):
+        parsed = urllib.parse.urlparse(arg)
+        if parsed.netloc not in ("", "localhost"):
+            raise ToolError(f"not a local file: {arg}")
+        arg = urllib.parse.unquote(parsed.path)
+    # Validate the file the path leads to, but keep the path as given: the
+    # output lands beside a symlink, not beside the symlink's target.
+    path = Path(arg).expanduser().absolute()
+    if not path.resolve().is_file():
+        raise ToolError(f"not a file: {path}")
+    return path
+
+
+def ext_of(path):
+    return path.suffix.lower().lstrip(".")
+
+
+def kind_of(path):
+    return EXT_KIND.get(ext_of(path))
+
+
+def need(*binaries):
+    return all(shutil.which(b) for b in binaries)
+
+
+def tool_available(tool_id):
+    needs = {
+        "compress": lambda k: need({"image": "magick", "video": "ffmpeg", "audio": "ffmpeg", "pdf": "gs"}[k]),
+        "strip-metadata": lambda k: need({"image": "magick", "video": "ffmpeg", "audio": "ffmpeg", "pdf": "qpdf"}[k]),
+    }
+    return needs.get(tool_id)
+
+
+def tool_ok(tool_id, kinds, count):
+    """Is tool_id valid for a selection of the given kinds (one per file)?"""
+    label, accepted, _ = TOOLS[tool_id]
+    if not kinds or not all(k in accepted for k in kinds):
+        return False
+    if tool_id == "merge-pdf" and count < 2:
+        return False
+    check = tool_available(tool_id)
+    if check:
+        return all(check(k) for k in set(kinds))
+    bins = {"resize-half": {"image": "magick", "video": "ffmpeg"}, "rotate": {"image": "magick", "video": "ffmpeg"},
+            "to-grayscale": {"image": "magick"}, "trim-silence": {"audio": "ffmpeg"},
+            "extract-audio": {"video": "ffmpeg"}, "snapshot": {"video": "ffmpeg"},
+            "merge-pdf": {"pdf": "qpdf"}, "split-pdf": {"pdf": "qpdf"}}[tool_id]
+    return all(need(bins[k]) for k in set(kinds))
+
+
+# --------------------------------------------------------------- outputs
+
+def free_name(directory, stem, ext):
+    candidate = directory / f"{stem}.{ext}"
+    n = 1
+    while os.path.lexists(candidate):  # lexists: a dangling symlink still takes the name
+        candidate = directory / f"{stem} ({n}).{ext}"
+        n += 1
+    return candidate
+
+
+def publish(tmp, directory, stem, ext):
+    """Move tmp to the first free name without ever replacing a file."""
+    while True:
+        final = free_name(directory, stem, ext)
+        try:
+            os.link(tmp, final)
+        except FileExistsError:
+            continue
+        except OSError:
+            if os.path.lexists(final):
+                continue
+            os.rename(tmp, final)
+            return final
+        os.unlink(tmp)
+        return final
+
+
+def temp_path(directory, ext):
+    # Name carries no user input: gs treats % in -sOutputFile as a format.
+    return directory / f".peel-tool-{secrets.token_hex(6)}.{ext}"
+
+
+# --------------------------------------------------------------- running
+
+def limited(argv):
+    if shutil.which("systemd-run"):
+        return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                "-p", f"MemoryMax={MEMORY_MAX}", "-p", "MemorySwapMax=0", "--"] + argv
+    return argv
+
+
+def last_line(text):
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    return lines[-1][:300] if lines else ""
+
+
+def run(argv, timeout, stdin=None, stdout=None, on_line=None, ok_codes=(0,)):
+    proc = subprocess.Popen(limited(argv), stdin=stdin or subprocess.DEVNULL,
+                            stdout=stdout or (subprocess.PIPE if on_line else subprocess.DEVNULL),
+                            stderr=subprocess.PIPE, text=on_line is not None,
+                            start_new_session=True)
+    try:
+        if on_line:
+            for line in proc.stdout:
+                on_line(line.rstrip("\n"))
+        _, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+        raise ToolError("timed out")
+    if proc.returncode not in ok_codes:
+        err = err if isinstance(err, str) else err.decode(errors="replace")
+        raise ToolError(last_line(err) or f"{argv[0]} exited with {proc.returncode}")
+
+
+def probe(src, entries, stream=None):
+    argv = ["ffprobe", "-v", "error", "-protocol_whitelist", "file"]
+    if stream:
+        argv += ["-select_streams", stream]
+    argv += ["-show_entries", entries, "-of", "csv=p=0", f"file:{src}"]
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                              stdin=subprocess.DEVNULL).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def check_demuxer(src, is_image=False):
+    """Refuse inputs whose real container format can reference other files.
+
+    The file name says nothing: clip.mp4 may hold an ffconcat script."""
+    try:
+        proc = subprocess.run(["ffprobe", "-v", "error", "-protocol_whitelist", "file",
+                               "-show_entries", "format=format_name", "-of", "csv=p=0", f"file:{src}"],
+                              capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ToolError("cannot identify the media format")
+    names = {n.strip() for n in proc.stdout.strip().split(",") if n.strip()}
+    if proc.returncode != 0 or not names:
+        raise ToolError("cannot identify the media format")
+    bad = names & (UNSAFE_DEMUXERS - ({"image2"} if is_image else set()))
+    if bad:
+        raise ToolError(f"unsafe media container ({', '.join(sorted(bad))}); refusing to process")
+
+
+def probe_duration(src):
+    try:
+        return float(probe(src, "format=duration"))
+    except ValueError:
+        return 0.0
+
+
+# --------------------------------------------------------------- engines
+
+def run_magick(src, ext, ops, out_ext, tmp):
+    coder_in, coder_out = IMAGE_CODER[ext], IMAGE_CODER[out_ext]
+    argv = ["magick", f"{coder_in}:-"]
+    if ext == "gif":
+        argv.append("-coalesce")
+    argv += ["-auto-orient"] + ops
+    if ext == "gif":
+        argv += ["-layers", "Optimize"]
+    argv.append(f"{coder_out}:-")
+    with open(src, "rb") as fin, open(tmp, "wb") as fout:
+        run(argv, TIMEOUT_SECONDS["magick"], stdin=fin, stdout=fout)
+
+
+def run_ffmpeg(src, pre, post, muxer, tmp, report=None, duration=None):
+    argv = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-protocol_whitelist", "file,pipe"] + pre + ["-i", f"file:{src}"] + post
+    argv += ["-progress", "pipe:1", "-nostats", "-f", muxer, f"file:{tmp}"]
+    if duration is None:
+        duration = probe_duration(src)
+
+    def on_line(line):
+        if report and duration > 0 and line.startswith("out_time_us="):
+            try:
+                report(min(99.0, int(line.split("=", 1)[1]) / 1e6 / duration * 100))
+            except ValueError:
+                pass
+
+    run(argv, TIMEOUT_SECONDS["ffmpeg"], on_line=on_line)
+
+
+def video_codec_args(out_ext, crf, abr):
+    if out_ext == "webm":
+        return ["-c:v", "libvpx-vp9", "-crf", str(crf), "-b:v", "0", "-row-mt", "1",
+                "-c:a", "libopus", "-b:a", "96k"]
+    args = ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", abr]
+    if out_ext in ("mp4", "m4v", "mov"):
+        args += ["-movflags", "+faststart"]
+    return args
+
+
+def video_out_ext(ext):
+    return "mp4" if ext in ("avi", "wmv") else ext
+
+
+def audio_lossy_args(ext, quality_high=True):
+    return {"mp3": ["-c:a", "libmp3lame", "-q:a", "2"], "m4a": ["-c:a", "aac", "-b:a", "192k"],
+            "ogg": ["-c:a", "libvorbis", "-q:a", "5"], "opus": ["-c:a", "libopus", "-b:a", "128k"],
+            "wav": ["-c:a", "pcm_s16le"], "flac": ["-c:a", "flac"], "aiff": ["-c:a", "pcm_s16be"],
+            "wma": ["-c:a", "wmav2", "-b:a", "192k"]}[ext]
+
+
+VMAP = ["-map", "0:v:0", "-map", "0:a?", "-sn", "-dn", "-map_metadata", "0"]
+
+
+# --------------------------------------------------------------- tools
+
+def do_compress(src, kind, ext, tmp, report):
+    if kind == "image":
+        run_magick(src, ext, ["-strip", "-resize", "2560x2560>", "-quality", "75"], ext, tmp)
+    elif kind == "video":
+        out = video_out_ext(ext)
+        crf = 38 if out == "webm" else 28
+        run_ffmpeg(src, [], VMAP + ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"] + video_codec_args(out, crf, "128k"),
+                   MUXER[out], tmp, report)
+    elif kind == "audio":
+        codec = {"mp3": ["-c:a", "libmp3lame", "-b:a", "128k"], "opus": ["-c:a", "libopus", "-b:a", "96k"],
+                 "ogg": ["-c:a", "libopus", "-b:a", "96k"], "m4a": ["-c:a", "aac", "-b:a", "128k"],
+                 "wma": ["-c:a", "wmav2", "-b:a", "128k"]}.get(ext)
+        if not codec:
+            raise Skip("lossless audio, nothing to compress")
+        run_ffmpeg(src, [], ["-vn", "-sn", "-dn", "-map", "0:a:0", "-map_metadata", "0"] + codec,
+                   MUXER[ext], tmp, report)
+    else:
+        run(["gs", "-sDEVICE=pdfwrite", "-dPDFSETTINGS=/ebook", "-dCompatibilityLevel=1.5", "-dSAFER",
+             "-dBATCH", "-dNOPAUSE", "-dQUIET", f"-sOutputFile={tmp}", "-f", str(src)],
+            TIMEOUT_SECONDS["gs"])
+
+
+def do_strip(src, kind, ext, tmp, report):
+    if kind == "image":
+        run_magick(src, ext, ["-strip"], ext, tmp)
+    elif kind == "pdf":
+        # Copying only the pages leaves the Info dictionary and XMP behind.
+        run(["qpdf", "--empty", "--pages", str(src), "--", str(tmp)], TIMEOUT_SECONDS["qpdf"], ok_codes=(0, 3))
+    else:
+        run_ffmpeg(src, [], ["-map", "0", "-map_metadata", "-1", "-map_chapters", "-1",
+                             "-fflags", "+bitexact", "-flags:v", "+bitexact", "-flags:a", "+bitexact",
+                             "-c", "copy"], MUXER[ext], tmp, report)
+
+
+def do_resize(src, kind, ext, tmp, report):
+    if kind == "image":
+        run_magick(src, ext, ["-resize", "50%"], ext, tmp)
+    else:
+        out = video_out_ext(ext)
+        run_ffmpeg(src, [], VMAP + ["-vf", "scale=trunc(iw/4)*2:trunc(ih/4)*2"]
+                   + video_codec_args(out, 32 if out == "webm" else 23, "160k"), MUXER[out], tmp, report)
+
+
+def do_rotate(src, kind, ext, tmp, report):
+    if kind == "image":
+        run_magick(src, ext, ["-rotate", "90"], ext, tmp)
+    else:
+        out = video_out_ext(ext)
+        run_ffmpeg(src, [], VMAP + ["-vf", "transpose=1,pad=ceil(iw/2)*2:ceil(ih/2)*2"]
+                   + video_codec_args(out, 32 if out == "webm" else 23, "160k"), MUXER[out], tmp, report)
+
+
+def do_gray(src, kind, ext, tmp, report):
+    run_magick(src, ext, ["-colorspace", "Gray"], ext, tmp)
+
+
+def do_trim(src, kind, ext, tmp, report):
+    edge = "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.05"
+    run_ffmpeg(src, [], ["-vn", "-sn", "-dn", "-map", "0:a:0", "-map_metadata", "0",
+                         "-af", f"{edge},areverse,{edge},areverse"] + audio_lossy_args(ext),
+               MUXER[ext], tmp, report)
+
+
+def do_extract_audio(src, kind, ext, tmp, report):
+    codec = probe(src, "stream=codec_name", "a:0")
+    if not codec:
+        raise ToolError("no audio track")
+    audio = ["-c:a", "copy"] if codec == "aac" else ["-c:a", "aac", "-b:a", "192k"]
+    run_ffmpeg(src, [], ["-vn", "-sn", "-dn", "-map", "0:a:0", "-map_metadata", "0"] + audio,
+               "ipod", tmp, report)
+
+
+def do_snapshot(src, kind, ext, tmp, report):
+    at = probe_duration(src) * 0.1
+    run_ffmpeg(src, ["-ss", f"{at:.3f}"], ["-map", "0:v:0", "-frames:v", "1", "-c:v", "png", "-update", "1"],
+               "image2", tmp, None, duration=0)
+
+
+# id -> (function, output ext function)
+SIMPLE = {
+    "compress": (do_compress, lambda k, e: video_out_ext(e) if k == "video" else e),
+    "strip-metadata": (do_strip, lambda k, e: e),
+    "resize-half": (do_resize, lambda k, e: video_out_ext(e) if k == "video" else e),
+    "rotate": (do_rotate, lambda k, e: video_out_ext(e) if k == "video" else e),
+    "to-grayscale": (do_gray, lambda k, e: e),
+    "trim-silence": (do_trim, lambda k, e: e),
+    "extract-audio": (do_extract_audio, lambda k, e: "m4a"),
+    "snapshot": (do_snapshot, lambda k, e: "png"),
+}
+
+
+def run_simple(tool_id, src, report, outdir=None):
+    kind = kind_of(src)
+    if kind not in TOOLS[tool_id][1]:
+        raise ToolError(f"{TOOLS[tool_id][0]} does not apply to this file type")
+    if not tool_ok(tool_id, [kind], 1):
+        raise ToolError("required program is not installed")
+    directory = outdir or src.parent
+    if not os.access(directory, os.W_OK):
+        raise ToolError(f"cannot write to {directory}")
+    if kind in ("video", "audio"):
+        check_demuxer(src, False)
+    func, out_ext_fn = SIMPLE[tool_id]
+    out_ext = out_ext_fn(kind, ext_of(src))
+    suffix = TOOLS[tool_id][2]
+    stem = f"{src.stem} ({suffix})" if suffix else src.stem
+    tmp = temp_path(directory, out_ext)
+    try:
+        func(src, kind, ext_of(src), tmp, report)
+        if not tmp.exists() or tmp.stat().st_size == 0:
+            raise ToolError("tool produced no output")
+        return [publish(tmp, directory, stem, out_ext)]
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def run_split(src, report, outdir=None):
+    if kind_of(src) != "pdf":
+        raise ToolError("Split pages only applies to PDFs")
+    directory = outdir or src.parent
+    if not os.access(directory, os.W_OK):
+        raise ToolError(f"cannot write to {directory}")
+    try:
+        count = int(subprocess.run(["qpdf", "--show-npages", str(src)], capture_output=True, text=True,
+                                   timeout=60, stdin=subprocess.DEVNULL).stdout.strip())
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        raise ToolError("cannot read PDF")
+    if count < 1:
+        raise ToolError("PDF has no pages")
+    made = []
+    try:
+        for page in range(1, count + 1):
+            tmp = temp_path(directory, "pdf")
+            try:
+                run(["qpdf", "--empty", "--pages", str(src), str(page), "--", str(tmp)],
+                    TIMEOUT_SECONDS["qpdf"], ok_codes=(0, 3))
+                if not tmp.exists() or tmp.stat().st_size == 0:
+                    raise ToolError("tool produced no output")
+                made.append(publish(tmp, directory, f"{src.stem} (page {page})", "pdf"))
+            finally:
+                tmp.unlink(missing_ok=True)
+            report(page / count * 100)
+    except BaseException:
+        for path in made:
+            path.unlink(missing_ok=True)
+        raise
+    return made
+
+
+def run_merge(sources, outdir=None):
+    first = sources[0]
+    directory = outdir or first.parent
+    if not os.access(directory, os.W_OK):
+        raise ToolError(f"cannot write to {directory}")
+    tmp = temp_path(directory, "pdf")
+    try:
+        run(["qpdf", "--empty", "--pages"] + [str(s) for s in sources] + ["--", str(tmp)],
+            TIMEOUT_SECONDS["qpdf"], ok_codes=(0, 3))
+        if not tmp.exists() or tmp.stat().st_size == 0:
+            raise ToolError("tool produced no output")
+        return publish(tmp, directory, f"{first.stem} (merged)", "pdf")
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+# --------------------------------------------------------------- commands
+
+def emit(enabled, **event):
+    if enabled:
+        print(json.dumps(event), flush=True)
+
+
+def notify(title, body):
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Peel", "--", title, body],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def output_dir(progress):
+    """The configured output folder, or None for beside the source. Asks the
+    sibling bin/peel, which owns the config format; warns once on fallback."""
+    try:
+        proc = subprocess.run([str(PEEL), "config", "--json"], capture_output=True, text=True,
+                              timeout=30, stdin=subprocess.DEVNULL)
+        output = json.loads(proc.stdout)["config"]["output"]
+        location, folder = output["location"], output["folder"]
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+        return None
+    if location != "folder":
+        return None
+    if folder and os.path.isdir(folder) and os.access(folder, os.W_OK | os.X_OK):
+        return Path(folder)
+    message = (f"output folder {folder} is missing or not writable; "
+               "saving next to the originals instead" if folder else
+               "no output folder is set; saving next to the originals instead")
+    if progress:
+        emit(progress, event="warning", message=message)
+    else:
+        print(f"peel-tool: {message}", file=sys.stderr)
+    return None
+
+
+def available_tools(paths):
+    kinds = []
+    for p in paths:
+        kind = kind_of(p)
+        if not kind:
+            raise ToolError(f"unsupported file type: {p.name}")
+        kinds.append(kind)
+    return [t for t in ORDER[kinds[0]] if tool_ok(t, kinds, len(kinds))]
+
+
+def cmd_targets(args, as_json):
+    tools = available_tools([to_path(a) for a in args])
+    if as_json:
+        print(json.dumps({"tools": [{"id": t, "label": TOOLS[t][0]} for t in tools]}))
+    else:
+        print(" ".join(tools))
+
+
+def cmd_run(tool_id, args, progress, want_notify):
+    if tool_id not in TOOLS:
+        raise ToolError(f"unknown tool: {tool_id}")
+    label = TOOLS[tool_id][0]
+    outputs, failures, skipped = [], [], 0
+    total = len(args)
+    outdir = output_dir(progress)
+
+    if tool_id == "merge-pdf":
+        sources = []
+        for index, arg in enumerate(args):
+            try:
+                src = to_path(arg)
+                if kind_of(src) != "pdf":
+                    raise ToolError("not a PDF")
+                sources.append(src)
+            except ToolError as error:
+                failures.append((arg, str(error)))
+                emit(progress, event="error", index=index, file=arg, message=str(error))
+        if len(sources) < 2 and not failures:
+            raise ToolError("Merge PDFs needs at least two PDFs")
+        if not failures:
+            emit(progress, event="start", index=0, total=1, file=str(sources[0]))
+            try:
+                result = run_merge(sources, outdir)
+                outputs.append(result)
+                emit(progress, event="done", index=0, file=str(sources[0]), output=str(result))
+                if not progress:
+                    print(result)
+            except ToolError as error:
+                failures.append((str(sources[0]), str(error)))
+                emit(progress, event="error", index=0, file=str(sources[0]), message=str(error))
+    else:
+        for index, arg in enumerate(args):
+            try:
+                src = to_path(arg)
+            except ToolError as error:
+                failures.append((arg, str(error)))
+                emit(progress, event="error", index=index, file=arg, message=str(error))
+                continue
+            emit(progress, event="start", index=index, total=total, file=str(src))
+
+            def report(pct, index=index):
+                emit(progress, event="progress", index=index, pct=round(pct, 1))
+
+            try:
+                if tool_id == "split-pdf":
+                    if not tool_ok(tool_id, [kind_of(src)], 1):
+                        raise ToolError("Split pages only applies to PDFs")
+                    results = run_split(src, report, outdir)
+                else:
+                    results = run_simple(tool_id, src, report, outdir)
+            except Skip as why:
+                skipped += 1
+                emit(progress, event="skipped", index=index, file=str(src), reason=str(why))
+                continue
+            except ToolError as error:
+                failures.append((str(src), str(error)))
+                emit(progress, event="error", index=index, file=str(src), message=str(error))
+                continue
+            outputs.extend(results)
+            emit(progress, event="done", index=index, file=str(src), output=str(results[0]),
+                 outputs=[str(r) for r in results])
+            if not progress:
+                for r in results:
+                    print(r)
+
+    emit(progress, event="finished", ok=len(outputs), failed=len(failures), skipped=skipped)
+    for src, message in failures:
+        print(f"peel-tool: {Path(src).name}: {message}", file=sys.stderr)
+
+    if want_notify:
+        if failures and not outputs:
+            notify(f"{label} failed", failures[0][1])
+        elif failures:
+            notify(f"{label}: {len(outputs)} done", f"{len(failures)} failed: {failures[0][1]}")
+        elif outputs:
+            body = outputs[0].name if len(outputs) == 1 else f"{len(outputs)} files in {outputs[0].parent}"
+            notify(f"{label} done", body)
+        elif skipped:
+            notify(f"{label}: nothing to do", "skipped")
+    return 1 if failures else 0
+
+
+def parser():
+    import argparse
+    p = argparse.ArgumentParser(prog="peel-tool", description="One-click file tools, offline.")
+    sub = p.add_subparsers(dest="command", required=True)
+    t = sub.add_parser("targets", help="list the tools valid for all FILEs")
+    t.add_argument("--json", action="store_true")
+    t.add_argument("files", nargs="+", metavar="FILE")
+    r = sub.add_parser("run", help="run one tool on FILE...")
+    r.add_argument("--tool", required=True, metavar="ID")
+    r.add_argument("--progress", action="store_true", help="print JSON progress events")
+    r.add_argument("--notify", action="store_true", help="send a desktop notification when done")
+    r.add_argument("files", nargs="+", metavar="FILE")
+    return p
+
+
+def main(argv):
+    args = parser().parse_args(argv)
+    try:
+        if args.command == "targets":
+            cmd_targets(args.files, args.json)
+            return 0
+        return cmd_run(args.tool, args.files, args.progress, args.notify)
+    except ToolError as error:
+        print(f"peel-tool: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

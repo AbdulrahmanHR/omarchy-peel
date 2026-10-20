@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""Register Peel's modifier/mouse binds with Hyprland at run time.
+
+    peel-binds register | unregister | status
+
+Binds are non-consuming and live in the Lua global __peel_binds (keyed by
+"<key>|<event>"); they are disabled, never hl.unbind'ed, so the user's own
+binds are untouched. Keys come from `peel config --json`.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+PEEL = os.environ.get("PEEL_BIN") or str(HERE / "peel")
+MOUSE = "mouse:272"
+OPTS = "non_consuming = true, dont_inhibit = true, submap_universal = true"
+
+
+class Fail(Exception):
+    pass
+
+
+def run(argv, timeout=5):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise Fail(f"{argv[0]}: {error}")
+
+
+def hyprctl(*args):
+    proc = run(["hyprctl", *args])
+    if proc.returncode != 0:
+        raise Fail(f"hyprctl {' '.join(args)} failed: {proc.stderr.strip() or proc.stdout.strip()}")
+    return proc.stdout
+
+
+def load_config():
+    proc = run([PEEL, "config", "--json"], timeout=10)
+    if proc.returncode != 0:
+        raise Fail(f"peel config failed: {proc.stderr.strip()}")
+    try:
+        data = json.loads(proc.stdout)
+        keys, allowed = data["config"]["keys"], data["options"]["keys"]
+    except (ValueError, KeyError, TypeError):
+        raise Fail("unexpected output from peel config --json")
+    for wheel, key in keys.items():
+        if key not in allowed or not wheel.isalpha():
+            raise Fail(f"refusing unvalidated key for {wheel}: {key!r}")
+    return keys
+
+
+def wanted(keys):
+    """List of (handle id, key, event, extra opts) for the current config."""
+    out = [(f"{key}|peel arm {wheel}", key, f"peel arm {wheel}", "")
+           for wheel, key in keys.items() if key != "off"]
+    # ignore_mods: Hyprland only fires a release bind when the modifiers match
+    # those at press time, and the gesture itself holds a modifier while the
+    # button goes down or up. Without it "lmb up" is lost and Peel would think
+    # the button is still held.
+    # The "|2" in the ids retires handles made before ignore_mods existed, which
+    # a re-register in the same Lua state would otherwise switch back on.
+    out.append((f"{MOUSE}|peel lmb down|2", MOUSE, "peel lmb down", ", ignore_mods = true"))
+    out.append((f"{MOUSE}|peel lmb up|2", MOUSE, "peel lmb up", ", release = true, ignore_mods = true"))
+    return out
+
+
+def register_lua(keys):
+    items = wanted(keys)
+    lines = ["__peel_binds = __peel_binds or {}", "local want = {}"]
+    for hid, _, _, _ in items:
+        lines.append(f'want["{hid}"] = true')
+    lines.append("for id, b in pairs(__peel_binds) do if not want[id] then b:set_enabled(false) end end")
+    for hid, key, event, extra in items:
+        lines.append(
+            f'if __peel_binds["{hid}"] then __peel_binds["{hid}"]:set_enabled(true) else '
+            f'__peel_binds["{hid}"] = hl.bind("{key}", hl.dsp.event("{event}"), {{ {OPTS}{extra} }}) end')
+    return "\n".join(lines)
+
+
+UNREGISTER_LUA = "if __peel_binds then for _, b in pairs(__peel_binds) do b:set_enabled(false) end end"
+
+
+def watched(keys):
+    return sorted({k for k in keys.values() if k != "off"} | {MOUSE})
+
+
+def plain_binds(keys):
+    """{key: (consuming, non_consuming)} for modmask-0 binds on our keys."""
+    watch = set(watched(keys))
+    counts = {}
+    for b in json.loads(hyprctl("-j", "binds") or "[]"):
+        if b.get("modmask") == 0 and b.get("key") in watch:
+            c, n = counts.get(b["key"], (0, 0))
+            counts[b["key"]] = (c, n + 1) if b.get("non_consuming") else (c + 1, n)
+    return counts
+
+
+def cmd_register():
+    keys = load_config()
+    lua = register_lua(keys)
+    if hyprctl("configerrors").strip():
+        raise Fail("Hyprland's config has errors; fix them first (an eval would clear that list)")
+    before = plain_binds(keys)
+    hyprctl("eval", lua)
+    after = plain_binds(keys)
+    for key in watched(keys):
+        c0, _ = before.get(key, (0, 0))
+        c1, n1 = after.get(key, (0, 0))
+        if c1 != c0 or n1 < 1:
+            hyprctl("eval", UNREGISTER_LUA)
+            raise Fail(f"{key}: binds did not register as non-consuming ({before} -> {after}); switched off")
+    print(json.dumps({"registered": True, "keys": keys}))
+
+
+def cmd_unregister():
+    hyprctl("eval", UNREGISTER_LUA)
+    print(json.dumps({"registered": False}))
+
+
+def cmd_status():
+    # Hyprland's bind list has no enabled flag and keeps binds switched off with
+    # set_enabled(false), so this can only say whether a bind exists on each key
+    # ("listed"), not whether it still fires.
+    keys = load_config()
+    counts = plain_binds(keys)
+    state = {k: counts.get(k, (0, 0))[1] > 0 for k in watched(keys)}
+    print(json.dumps({"listed": all(state.values()), "keys": state}))
+
+
+def main(argv):
+    if len(argv) != 1 or argv[0] not in ("register", "unregister", "status"):
+        print("usage: peel-binds register|unregister|status", file=sys.stderr)
+        return 2
+    try:
+        {"register": cmd_register, "unregister": cmd_unregister, "status": cmd_status}[argv[0]]()
+        return 0
+    except Fail as error:
+        print(f"peel-binds: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

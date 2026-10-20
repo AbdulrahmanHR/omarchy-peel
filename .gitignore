@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# Local test harnesses; not part of the plugin
+prototypes/
