@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Hyprland
 import Quickshell.Io
+import "Shared.js" as Shared
 
 // Peel's always-loaded half: Hyprland binds, the drag catcher and the job queue.
 //
@@ -125,8 +126,14 @@ Item {
     onTriggered: root.registerBinds()
   }
 
-  Component.onCompleted: reloadConfig()
-  Component.onDestruction: Quickshell.execDetached([root.bindsBin, "unregister"])
+  Component.onCompleted: {
+    Shared.setService(root)
+    reloadConfig()
+  }
+  Component.onDestruction: {
+    if (Shared.service === root) Shared.setService(null)
+    Quickshell.execDetached([root.bindsBin, "unregister"])
+  }
 
   // --- arming -----------------------------------------------------------------
 

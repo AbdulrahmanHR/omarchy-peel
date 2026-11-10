@@ -5,6 +5,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "Shared.js" as Shared
 
 // Peel bar widget: a convert icon (with live progress while a job runs) and a
 // small keyboard-driven panel with the wheel keys and the recent jobs.
@@ -18,11 +19,15 @@ Panel {
 
   readonly property string pluginId: "io.github.abdulrahmanhr.peel"
 
-  // Injected by the shell for plugin entry points; falls back to the bar's.
+  // Injected by the shell for plugin entry points; falls back to the bar's or Shared.js.
   property var shell: null
+  property var sharedPeel: Shared.service
+  readonly property var _sharedListener: function(inst) { root.sharedPeel = inst }
+  Component.onCompleted: sharedPeel = Shared.subscribe(_sharedListener)
+  Component.onDestruction: Shared.unsubscribe(_sharedListener)
   readonly property var shellApi: root.shell ? root.shell : (root.bar ? root.bar.shell : null)
-  readonly property var peel: shellApi && typeof shellApi.serviceFor === "function"
-    ? shellApi.serviceFor(pluginId) : null
+  readonly property var peel: (shellApi && typeof shellApi.serviceFor === "function"
+    ? shellApi.serviceFor(pluginId) : null) || sharedPeel
 
   // Cursor model shared by keyboard and mouse:
   //   convert, tools, actions   key choice rows; selectedIndex is the option
@@ -384,7 +389,9 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: root.barText
+    text: root.iconGlyph
+    labelText: root.busy && !vertical ? root.activePct + "%" : ""
+    slotSize: Style.bar.iconSlot * (root.busy && !vertical ? 2 : 1)
     foreground: root.barIconColor
     tooltipText: root.barTooltip
     onPressed: function(buttonCode) { root.toggle() }
