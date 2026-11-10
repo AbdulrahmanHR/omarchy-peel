@@ -107,7 +107,10 @@ Item {
                     x: root.cx + root.innerRadius * Math.cos(seg.endRad)
                     y: root.cy + root.innerRadius * Math.sin(seg.endRad)
                 }
+                // moveToStart defaults to true, which would start a new subpath
+                // and close the outer arc as a triangle instead of a ring slice.
                 PathAngleArc {
+                    moveToStart: false
                     centerX: root.cx; centerY: root.cy
                     radiusX: root.innerRadius; radiusY: root.innerRadius
                     startAngle: seg.startA + seg.sweepA
