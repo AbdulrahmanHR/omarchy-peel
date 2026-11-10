@@ -215,6 +215,24 @@ bar in the bar settings; it shows conversions in progress and lets you change
 the wheel keys, quality and output folder. The wheels work once the plugin is
 enabled; the widget is how you configure them.
 
+## Uninstall
+
+```bash
+omarchy plugin remove io.github.abdulrahmanhr.peel
+```
+
+This removes the plugin folder. Peel's run-time Hyprland binds are switched off
+when the plugin stops, so nothing is left in your Hyprland config. If you linked
+the Nautilus extension, remove the link too:
+
+```bash
+rm ~/.local/share/nautilus-python/extensions/peel.py
+nautilus -q
+```
+
+Your settings stay in `~/.config/peel/`; delete that folder if you don't want
+them any more. Converted files are never touched.
+
 ## Development
 
 Tests need no Wayland session:
