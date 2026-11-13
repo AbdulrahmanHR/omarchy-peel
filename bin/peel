@@ -59,7 +59,7 @@ TIMEOUT_SECONDS = {"magick": 600, "rsvg": 300, "ffmpeg": 4 * 3600, "soffice": 90
 # Executables each engine needs; a target is only offered when they exist.
 # (The archive engine decides per pair, see archive_tools.)
 ENGINE_TOOLS = {"magick": ["magick"], "rsvg": ["rsvg-convert"], "ffmpeg": ["ffmpeg", "ffprobe"],
-                "soffice": ["soffice"], "soffice-raster": ["soffice", "pdftoppm"],
+                "soffice": ["soffice", "bwrap"], "soffice-raster": ["soffice", "bwrap", "pdftoppm"],
                 "pandoc": ["pandoc"], "poppler-raster": ["pdftoppm"], "poppler-text": ["pdftotext"], "pdf2docx": ["pdf2docx"]}
 SEVENZ_INPUTS = ("7z", "rar")
 
@@ -420,19 +420,51 @@ def write_office_profile(profile):
     (user / "registrymodifications.xcu").write_text(MACRO_LOCKDOWN_XCU, encoding="utf-8")
 
 
+def office_sandbox(work, src, inside):
+    """bubblewrap prefix for LibreOffice: the system (/usr, /etc, font
+    caches) read-only, the job's work dir read-write, the one input file
+    read-only at `inside`, no network, and nothing else of the filesystem.
+
+    LibreOffice's HTML import (also reached through DOCX altChunk, and
+    through HTML content behind a .doc/.rtf/.ppt name) loads images and
+    backgrounds from any readable path straight into the document, macro
+    profile or not. Inside the sandbox the user's files do not exist."""
+    box = ["bwrap", "--die-with-parent", "--new-session", "--unshare-all",
+           "--ro-bind", "/usr", "/usr", "--ro-bind", "/etc", "/etc"]
+    for top in ("/bin", "/sbin", "/lib", "/lib64"):
+        if os.path.islink(top):
+            box += ["--symlink", os.readlink(top), top]
+        elif os.path.isdir(top):
+            box += ["--ro-bind", top, top]
+    if os.path.isdir("/var/cache/fontconfig"):
+        box += ["--ro-bind", "/var/cache/fontconfig", "/var/cache/fontconfig"]
+    box += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+            "--bind", str(work), str(work), "--ro-bind", str(src), str(inside)]
+    # The user's own fonts (font files only), so documents keep their typefaces.
+    home = Path.home()
+    for fonts in (home / ".local/share/fonts", home / ".fonts"):
+        box += ["--ro-bind-try", str(fonts), str(work / fonts.relative_to(home))]
+    box += [
+            "--clearenv", "--setenv", "HOME", str(work), "--setenv", "PATH", "/usr/bin",
+            "--setenv", "LANG", "C.UTF-8", "--chdir", str(work), "--"]
+    return box
+
+
 def convert_soffice(src, src_key, out_key, work):
     """LibreOffice headless into work/out; returns the produced file.
 
     Each job gets its own profile (no lock contention between concurrent
-    jobs) and reads the source through a symlink with a fixed safe name,
-    so the file name never reaches LibreOffice's option or filter parsing."""
+    jobs) and runs inside office_sandbox. The source is bind-mounted under
+    a fixed safe name, so the file name never reaches LibreOffice's option
+    or filter parsing."""
     profile, outdir, indir = work / "profile", work / "out", work / "in"
     for d in (profile, outdir, indir):
         d.mkdir()
     write_office_profile(profile)
     link = indir / f"input.{src_key}"
-    link.symlink_to(src)
-    argv = ["soffice", "--headless", "--norestore", f"-env:UserInstallation={file_url(profile)}"]
+    link.touch()  # mount point; office_sandbox binds the real source over it
+    argv = office_sandbox(work, Path(src).resolve(), link)
+    argv += ["soffice", "--headless", "--norestore", f"-env:UserInstallation={file_url(profile)}"]
     infilter = FORMATS[src_key].get("infilter")
     if infilter:
         argv.append(f"--infilter={infilter}")
@@ -440,7 +472,7 @@ def convert_soffice(src, src_key, out_key, work):
              "--outdir", str(outdir), str(link)]
     run(argv, TIMEOUT_SECONDS["soffice"])
     result = outdir / f"input.{out_key}"
-    if not result.is_file():
+    if result.is_symlink() or not result.is_file():
         raise PeelError("LibreOffice could not convert this file")
     if out_key == "txt":  # LibreOffice writes a UTF-8 byte order mark
         data = result.read_bytes()

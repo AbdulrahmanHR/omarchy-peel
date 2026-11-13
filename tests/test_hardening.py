@@ -132,7 +132,7 @@ class ArchiveBomb(Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
-@unittest.skipUnless(shutil.which("soffice"), "soffice not installed")
+@unittest.skipUnless(shutil.which("soffice") and shutil.which("bwrap"), "soffice and bwrap needed")
 class MacroProfile(Base):
     def test_profile_helper_writes_lockdown(self):
         peel = load(PEEL, "peel_profile")
@@ -155,6 +155,82 @@ class MacroProfile(Base):
         peel.convert_soffice(src, "txt", "odt", self.work)
         self.assertEqual(len(seen), 1)
         self.assertTrue((seen[0] / "user" / "registrymodifications.xcu").is_file())
+
+
+@unittest.skipUnless(shutil.which("soffice") and shutil.which("bwrap") and shutil.which("pdfimages"),
+                     "soffice, bwrap and poppler needed")
+class OfficeLocalFiles(Base):
+    """LibreOffice's HTML import embeds any readable local image; the
+    sandbox must keep files outside the input from reaching the output."""
+
+    def setUp(self):
+        super().setUp()
+        self.secret = self.tmp / "secret" / "s.png"
+        self.secret.parent.mkdir()
+        self.png(self.secret)
+        self.url = "file://" + str(self.secret)
+        self.docs = self.tmp / "docs"
+        self.docs.mkdir()
+
+    def html(self):
+        return (f'<html><body background="{self.url}"><p>hello</p>'
+                f'<table background="{self.url}"><tr><td>cell</td></tr></table>'
+                f'<form><input type=image src="{self.url}"></form></body></html>')
+
+    def pdf_images(self, pdf):
+        out = subprocess.run(["pdfimages", "-list", str(pdf)], capture_output=True, text=True, check=True).stdout
+        return len(out.strip().splitlines()) - 2
+
+    def convert(self, src, to):
+        proc = run(PEEL, "convert", "--to", to, src, config=self.config)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return Path(proc.stdout.strip())
+
+    def test_html_to_pdf_and_odt_leave_local_images_out(self):
+        src = self.docs / "page.html"
+        src.write_text(self.html())
+        self.assertEqual(self.pdf_images(self.convert(src, "pdf")), 0)
+        with zipfile.ZipFile(self.convert(src, "odt")) as z:
+            self.assertFalse([n for n in z.namelist() if n.startswith("Pictures/")])
+
+    def test_html_behind_other_extensions(self):
+        for ext in ("doc", "rtf", "ppt"):
+            src = self.docs / f"page.{ext}"
+            src.write_text(self.html())
+            self.assertEqual(self.pdf_images(self.convert(src, "pdf")), 0, ext)
+
+    def test_docx_altchunk(self):
+        src = self.docs / "chunk.docx"
+        rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        pkg = "http://schemas.openxmlformats.org/package/2006/relationships"
+        with zipfile.ZipFile(src, "w") as z:
+            z.writestr("[Content_Types].xml",
+                       '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                       '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+                       '<Default Extension="xml" ContentType="application/xml"/><Default Extension="html" ContentType="text/html"/>'
+                       '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>')
+            z.writestr("_rels/.rels", f'<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="{pkg}">'
+                       f'<Relationship Id="rId1" Type="{rel}/officeDocument" Target="word/document.xml"/></Relationships>')
+            z.writestr("word/_rels/document.xml.rels", f'<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="{pkg}">'
+                       f'<Relationship Id="rIdA" Type="{rel}/aFChunk" Target="chunk.html"/></Relationships>')
+            z.writestr("word/document.xml",
+                       '<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+                       f'xmlns:r="{rel}"><w:body><w:p><w:r><w:t>before</w:t></w:r></w:p><w:altChunk r:id="rIdA"/></w:body></w:document>')
+            z.writestr("word/chunk.html", self.html())
+        self.assertEqual(self.pdf_images(self.convert(src, "pdf")), 0)
+
+    def test_sandbox_binds_only_system_work_and_input(self):
+        peel = load(PEEL, "peel_sandbox")
+        src = self.docs / "a.txt"
+        box = peel.office_sandbox(self.work, src, self.work / "in" / "input.txt")
+        self.assertIn("--unshare-all", box)
+        self.assertIn("--clearenv", box)
+        binds = [box[i + 1] for i, a in enumerate(box) if a in ("--bind", "--ro-bind")]
+        home = str(Path.home())
+        allowed = {str(self.work), str(src)}
+        for path in binds:
+            self.assertTrue(path in allowed or not path.startswith(home), path)
+            self.assertNotIn(path, ("/", "/home", "/tmp", "/run", home))
 
 
 class SymlinkedInputs(Base):

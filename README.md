@@ -168,6 +168,11 @@ peel config set output.folder ~/Converted
   shell. File names are never parsed as commands.
 - Each conversion runs in a memory-capped `systemd-run --user` scope, so a
   hostile or broken file cannot take the machine down with it.
+- LibreOffice runs inside a `bwrap` sandbox with no network that sees only
+  the system directories, its own throwaway profile (macros off) and the one
+  file being converted. A document cannot pull other files from your home
+  directory into its output (LibreOffice's HTML import otherwise embeds any
+  readable local image it references).
 - Archives are checked before they are extracted: absolute paths, `..`
   components, links that leave the archive, special files and hard links are
   rejected.
@@ -182,7 +187,7 @@ peel config set output.folder ~/Converted
 
 ```bash
 sudo pacman -S ffmpeg imagemagick librsvg libreoffice-fresh poppler \
-  ghostscript qpdf 7zip libarchive libheif wl-clipboard python
+  ghostscript qpdf 7zip libarchive libheif wl-clipboard python bubblewrap
 ```
 
 | Package | Used for |
@@ -190,7 +195,7 @@ sudo pacman -S ffmpeg imagemagick librsvg libreoffice-fresh poppler \
 | `ffmpeg` | audio, video, GIF; most video and audio tools |
 | `imagemagick`, `libheif` | images, including HEIC and AVIF |
 | `librsvg` | SVG |
-| `libreoffice-fresh` | documents, spreadsheets, slides |
+| `libreoffice-fresh`, `bubblewrap` | documents, spreadsheets, slides (LibreOffice only runs sandboxed) |
 | `poppler` | PDF to images and text |
 | `ghostscript`, `qpdf` | PDF compress, merge, split, clean metadata |
 | `7zip`, `libarchive` | archives |
