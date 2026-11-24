@@ -72,7 +72,7 @@ class ConfigTests(Base):
     def test_defaults_and_shape(self):
         out = self.cfg_json()
         self.assertEqual(out["config"], {"version": 1, "keys": {"convert": "Shift_L", "tools": "Control_L", "actions": "Alt_L"},
-                                         "quality": "balanced", "output": {"location": "beside", "folder": ""}, "advanced": {}})
+                                         "quality": "balanced", "output": {"location": "beside", "folder": ""}, "advanced": {}, "tools": {}})
         self.assertIn("off", out["options"]["keys"])
         self.assertEqual(out["path"], str(self.cfg / "peel" / "config.json"))
 

@@ -104,16 +104,18 @@ Tools (`peel-tool targets FILE...` lists the ones valid for your files):
 
 | Tool | What it does | Works on |
 |---|---|---|
-| Compress | Smaller file, same format | images, video, audio, PDF |
+| Compress | Smaller file, same format; light / medium / strong | images, video, audio, PDF |
 | Remove info | Removes hidden details: GPS location, camera, author, dates; output is named `name (no info)` | images, video, audio, PDF |
-| Half size | Half the width and height | images, video |
-| Rotate | Turn 90° clockwise | images, video |
+| Resize | Smaller copy: 50% by default, or 25% / 75% | images, video |
+| Rotate | Turn 90° clockwise by default, or 180° / 270°; PDFs can rotate only chosen pages | images, video, PDF |
 | Grayscale | Black and white copy | images |
-| Trim silence | Cut the silence at the start and end | audio |
+| Trim silence | Cut the silence at the start and end (threshold -60 / -50 / -40 dB) | audio |
 | Extract audio | Save the soundtrack as M4A | video |
-| Snapshot | Save one frame as a PNG | video |
-| Merge PDFs | Join the PDFs into one, in order | PDF |
-| Split pages | One PDF per page | PDF |
+| Snapshot | Save one frame as a PNG, at 10% of the video by default (0-100%) | video |
+| Merge PDFs | Join the PDFs into one, in the order shown; pick pages per file, or insert the others into the first PDF after a chosen page | PDF |
+| Split pages | One PDF per page by default; or every N pages, one file per range (`1-3, 5, 8-end`), equal parts, chosen pages into one PDF, or everything but chosen pages; pages accept `odd`, `even`, `1-9:2`; optional output folder | PDF |
+
+Options are saved with `peel config set tools.<key> VALUE`, or passed per run as `peel-tool run --opt KEY=VALUE`; see [docs/tool-options.md](docs/tool-options.md).
 
 Actions:
 

@@ -119,18 +119,21 @@ class Targets(Fixtures):
         self.assertEqual(targets(self.wav), ["compress", "trim-silence", "strip-metadata"])
 
     def test_single_pdf(self):
-        self.assertEqual(targets(self.pdf), ["compress", "split-pdf", "strip-metadata"])
+        self.assertEqual(targets(self.pdf), ["compress", "split-pdf", "rotate", "strip-metadata"])
 
     def test_two_pdfs(self):
-        self.assertEqual(targets(self.pdf, self.pdf2), ["compress", "merge-pdf", "split-pdf", "strip-metadata"])
+        self.assertEqual(targets(self.pdf, self.pdf2), ["compress", "merge-pdf", "split-pdf", "rotate", "strip-metadata"])
 
     def test_mixed_is_intersection(self):
         self.assertEqual(targets(self.png, self.mp4), ["compress", "resize-half", "strip-metadata", "rotate"])
-        self.assertEqual(targets(self.png, self.pdf), ["compress", "strip-metadata"])
+        self.assertEqual(targets(self.png, self.pdf), ["compress", "strip-metadata", "rotate"])
 
     def test_labels(self):
         data = json.loads(tool("targets", "--json", "--", self.png).stdout)
-        self.assertEqual(data["tools"][0], {"id": "compress", "label": "Compress"})
+        self.assertEqual(data["tools"][0], {"id": "compress", "label": "Compress",
+                                            "options": ["compress.level"], "ask": False})
+        labels = {t["id"]: t["label"] for t in json.loads(tool("targets", "--json", "--", self.mp4).stdout)["tools"]}
+        self.assertEqual(labels["resize-half"], "Resize")
 
 
 class Image(Fixtures):

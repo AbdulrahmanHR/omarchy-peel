@@ -33,6 +33,10 @@ Item {
   // advanced fields (with each preset's value) and output locations.
   property var options: ({})
   property string configPath: ""
+  // Tool option schema (`options.tools` of `peel config --json`) and the saved
+  // value of every remembered field, keyed by field key.
+  property var toolFields: []
+  property var effectiveTools: ({})
   property string bindsError: ""
 
   function reloadConfig() {
@@ -74,6 +78,8 @@ Item {
           root.config = data.config
           root.keyOptions = data.options.keys
           root.options = data.options
+          root.toolFields = data.options.tools || []
+          root.effectiveTools = data.effectiveTools || data.options.effectiveTools || {}
           root.configPath = data.path
         } catch (e) {
           console.warn("peel: cannot read config: " + e)
@@ -275,6 +281,8 @@ Item {
             list = (JSON.parse(text)[tp.listKey] || []).map(t => ({
               id: t.ext || t.id,
               label: t.label,
+              options: t.options || [],
+              ask: t.ask === true,
               description: tp.listKey === "tools"
                 ? (root.toolDescriptions[t.id] || "")
                 : "Save a " + t.label + " copy" + (root.config.output && root.config.output.location === "folder" && root.config.output.folder
@@ -290,8 +298,62 @@ Item {
     }
   }
 
-  function enqueue(wheel, target, label, paths) {
+  // `peel-tool info`: callback({ files: [{ path, kind, pages? }] }); {} on failure.
+  function infoFor(paths, callback) {
+    var proc = jsonComponent.createObject(root, {
+      command: [root.toolBin, "info", "--json", "--"].concat(paths), callback: callback })
+    proc.running = true
+  }
+
+  // `peel-tool check`: callback({ ok, error, outputs, summary }); a failure to
+  // run at all comes back as ok: false with an error.
+  // opts: { key: value }.
+  function checkTool(tool, opts, paths, callback) {
+    var optArgs = []
+    var keys = Object.keys(opts || {})
+    for (var i = 0; i < keys.length; i++) optArgs.push("--opt", keys[i] + "=" + String(opts[keys[i]]))
+    var proc = jsonComponent.createObject(root, {
+      command: [root.toolBin, "check", "--json", "--tool", tool].concat(optArgs, ["--"], paths),
+      callback: callback,
+      fallback: { ok: false, error: "Could not check these settings", outputs: 0, summary: "" } })
+    proc.running = true
+  }
+
+  Component {
+    id: jsonComponent
+    Process {
+      id: jp
+      property var callback: null
+      property var fallback: ({})
+      property bool delivered: false
+
+      // Exactly one callback, then gone: on output, on exit without output,
+      // or after 8 s if the process never started or hangs.
+      function finish(value) {
+        if (delivered) return
+        delivered = true
+        running = false
+        if (callback) callback(value)
+        destroy()
+      }
+
+      stdout: StdioCollector {
+        onStreamFinished: {
+          var value = jp.fallback
+          try { value = JSON.parse(text) } catch (e) {}
+          jp.finish(value)
+        }
+      }
+      onExited: Qt.callLater(() => { if (jp) jp.finish(jp.fallback) })
+      property Timer guard: Timer { interval: 8000; running: true; onTriggered: jp.finish(jp.fallback) }
+    }
+  }
+
+  // opts: optional { key: value } of tool options; every value goes in as one
+  // "--opt key=value" argv pair (peel-tool validates).
+  function enqueue(wheel, target, label, paths, opts) {
     var job = { id: nextJobId++, wheel: wheel, target: target, label: label, files: paths,
+                opts: opts || {},
                 state: "queued", pct: 0, index: 0, done: 0, failed: 0, outputs: [], error: "" }
     jobs = jobs.concat([job])
     pump()
@@ -306,8 +368,11 @@ Item {
     var job = jobs[0]
     updateJob(job.id, { state: "running" })
     jobProc.jobId = job.id
+    var optArgs = []
+    var keys = Object.keys(job.opts || {})
+    for (var i = 0; i < keys.length; i++) optArgs.push("--opt", keys[i] + "=" + String(job.opts[keys[i]]))
     jobProc.command = job.wheel === "tools"
-      ? [root.toolBin, "run", "--tool", job.target, "--progress", "--notify", "--"].concat(job.files)
+      ? [root.toolBin, "run", "--tool", job.target].concat(optArgs, ["--progress", "--notify", "--"], job.files)
       : [root.peelBin, "convert", "--to", job.target, "--progress", "--notify", "--"].concat(job.files)
     jobProc.running = true
   }
@@ -323,13 +388,18 @@ Item {
         if (!job) return
         if (ev.event === "start") root.updateJob(job.id, { index: ev.index, pct: 0 })
         else if (ev.event === "progress") root.updateJob(job.id, { pct: ev.pct })
-        else if (ev.event === "done") root.updateJob(job.id, { done: job.done + 1, outputs: job.outputs.concat([ev.output]) })
+        else if (ev.event === "done") root.updateJob(job.id, { done: job.done + 1, outputs: job.outputs.concat(ev.outputs || [ev.output]) })
+        else if (ev.event === "finished") root.updateJob(job.id, { finished: true })
         else if (ev.event === "error") root.updateJob(job.id, { failed: job.failed + 1, error: ev.message })
       }
     }
-    onExited: {
+    onExited: (code) => {
       var job = root.jobs.find(j => j.id === jobProc.jobId)
       if (job) {
+        // A non-zero exit, or no "finished" event, is a failure even when no
+        // "error" event arrived (crash, kill, bad option).
+        var broken = code !== 0 || !job.finished
+        if (broken && !job.failed) job = Object.assign({}, job, { failed: 1, error: job.error || "Stopped before finishing (exit " + code + ")" })
         root.history = [Object.assign({}, job, { state: job.failed ? "failed" : "done", pct: 100 })]
           .concat(root.history).slice(0, 20)
         root.jobs = root.jobs.filter(j => j.id !== job.id)
@@ -343,14 +413,14 @@ Item {
   readonly property var toolDescriptions: ({
     "compress": "Smaller file, same format",
     "strip-metadata": "Removes hidden details: GPS location, camera, author, dates",
-    "resize-half": "Half the width and height",
-    "rotate": "Turn 90° clockwise",
+    "resize-half": "Smaller copy, 50% by default",
+    "rotate": "Turn it; 90° clockwise by default",
     "to-grayscale": "Black and white copy",
     "trim-silence": "Cut the silence at the start and end",
     "extract-audio": "Save the soundtrack as M4A",
     "snapshot": "Save one frame as a PNG",
     "merge-pdf": "Join the PDFs into one, in order",
-    "split-pdf": "One PDF per page"
+    "split-pdf": "By page, every N pages or ranges"
   })
 
   readonly property var actionSegments: [

@@ -142,7 +142,7 @@ Item {
             elide: Text.ElideRight
             horizontalAlignment: Text.AlignHCenter
             lineHeight: 0.95
-            text: root.segments[index] ? (root.segments[index].label ?? root.segments[index].id ?? "") : ""
+            text: root.segments[index] ? (root.segments[index].label ?? root.segments[index].id ?? "") + (root.segments[index].ask === true ? "…" : "") : ""
             color: hovered ? root.accentInk : root.foreground
             font.family: root.fontFamily
             font.pixelSize: root.labelSize
@@ -172,7 +172,7 @@ Item {
                 width: parent.width
                 horizontalAlignment: Text.AlignHCenter
                 elide: Text.ElideRight
-                text: parent.hovered ? (parent.hovered.label ?? parent.hovered.id ?? "") : root.title
+                text: parent.hovered ? (parent.hovered.label ?? parent.hovered.id ?? "") + (parent.hovered.ask === true ? "…" : "") : root.title
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: parent.hovered ? 20 : 16

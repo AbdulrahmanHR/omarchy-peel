@@ -35,6 +35,12 @@ Item {
   property bool loadingTargets: false
   property bool loadingTools: false
   property bool wheelPlaced: false
+  // The options card is up for a tool with settings: nothing may unmap the
+  // layer until it is run or cancelled.
+  property bool optionsOpen: false
+  // The exclusive keyboard grab for the card, requested a beat after it opens
+  // so it never goes out in the middle of a drop handshake.
+  property bool optionsFocus: false
   property string screenName: ""
 
   readonly property var segments: {
@@ -69,6 +75,7 @@ Item {
 
   function arm(wheel) {
     if (["convert", "tools", "actions"].indexOf(wheel) < 0) return
+    if (optionsOpen) return
     mode = wheel
     if (mapped) return
     var monitor = Hyprland.focusedMonitor
@@ -88,6 +95,10 @@ Item {
     noDragTimer.stop()
     releaseTimer.stop()
     exitTimer.stop()
+    optionsCard.end()
+    optionsOpen = false
+    optionsFocus = false
+    optionsFocusTimer.stop()
     mapped = false
     dragInside = false
     keyboardMode = false
@@ -99,6 +110,11 @@ Item {
     convertSegments = []
     toolSegments = []
     generation++
+  }
+
+  // Timers and the drop path: close the layer unless the options card is up.
+  function softDisarm() {
+    if (!optionsOpen) disarm()
   }
 
   // Bumped on every open and close, so a slow answer for an earlier drag can
@@ -125,6 +141,7 @@ Item {
   // x, y: cursor in Hyprland's global layout coordinates.
   function openKeyboard(wheel, files, x, y) {
     if (mapped && !keyboardMode) return  // a drag owns the catcher
+    if (optionsOpen) return
     if (["convert", "tools", "actions"].indexOf(wheel) < 0) wheel = "convert"
     var monitor = Hyprland.focusedMonitor
     screenName = monitor ? String(monitor.name || "") : ""
@@ -153,12 +170,35 @@ Item {
     wheel_.hoveredIndex = -1
   }
 
-  function apply(index) {
+  // force: Shift+Enter in keyboard mode, the card for any tool with options.
+  function apply(index, force) {
     var segment = index >= 0 ? segments[index] : null
     if (!segment || !paths.length) return false
-    if (mode === "convert" || mode === "tools") service.enqueue(mode, segment.id, segment.label, paths)
+    if (mode === "tools" && (segment.ask === true || (force === true && (segment.options || []).length)))
+      openOptions(segment)
+    else if (mode === "convert" || mode === "tools") service.enqueue(mode, segment.id, segment.label, paths)
     else if (mode === "actions") service.runAction(segment.id, paths)
     return true
+  }
+
+  // The card for a tool with settings, in place of the wheel.
+  function openOptions(segment) {
+    var listed = segment.options || []
+    var fields = (service.toolFields || []).filter(f => f.tool === segment.id
+      && (!listed.length || listed.indexOf(f.key) >= 0))
+    if (!fields.length) {  // nothing to ask: run with the saved settings
+      service.enqueue("tools", segment.id, segment.label, paths)
+      return
+    }
+    noDragTimer.stop()
+    releaseTimer.stop()
+    exitTimer.stop()
+    dwellTimer.stop()
+    dwellTab = -1
+    optionsOpen = true
+    optionsFocusTimer.tries = 0
+    optionsFocusTimer.restart()
+    optionsCard.begin(segment.id, segment.label, paths, fields, service.effectiveTools || {})
   }
 
   // The drop arrives on release too, through Wayland rather than the event
@@ -214,11 +254,26 @@ Item {
     return wheel_.indexAt(x - wheel_.x, y - wheel_.y)
   }
 
+  // Grabs the keyboard shortly after the card opens and asks for focus again
+  // a couple of times in case the compositor was still busy with the drop.
+  Timer {
+    id: optionsFocusTimer
+    property int tries: 0
+    interval: 60
+    repeat: true
+    onTriggered: {
+      if (!root.optionsOpen) { stop(); return }
+      root.optionsFocus = true
+      optionsCard.applyFocus()
+      if (++tries >= 4) stop()
+    }
+  }
+
   Timer { id: dwellTimer; interval: 250; onTriggered: if (root.dwellTab >= 0) root.switchToTab(root.dwellTab) }
 
-  Timer { id: noDragTimer; interval: 1500; onTriggered: if (!root.dragInside) root.disarm() }
-  Timer { id: releaseTimer; interval: 250; onTriggered: root.disarm() }
-  Timer { id: exitTimer; interval: 200; onTriggered: if (!root.dragInside) root.disarm() }
+  Timer { id: noDragTimer; interval: 1500; onTriggered: if (!root.dragInside) root.softDisarm() }
+  Timer { id: releaseTimer; interval: 250; onTriggered: root.softDisarm() }
+  Timer { id: exitTimer; interval: 200; onTriggered: if (!root.dragInside) root.softDisarm() }
 
   PanelWindow {
     id: window
@@ -234,25 +289,25 @@ Item {
     exclusionMode: ExclusionMode.Ignore
     WlrLayershell.namespace: "peel-catcher"
     WlrLayershell.layer: WlrLayer.Overlay
-    WlrLayershell.keyboardFocus: root.keyboardMode ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+    WlrLayershell.keyboardFocus: (root.keyboardMode || root.optionsFocus) ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
 
     // Keyboard mode only: a click away from a segment closes, hover picks.
     MouseArea {
       anchors.fill: parent
-      enabled: root.keyboardMode
+      enabled: root.keyboardMode && !root.optionsOpen
       hoverEnabled: true
       onPositionChanged: (mouse) => root.pointerAt(mouse.x, mouse.y, false)
       onClicked: (mouse) => {
         var tab = wheel_.modeAt(mouse.x - wheel_.x, mouse.y - wheel_.y)
         if (tab >= 0) { root.switchToTab(tab); return }
         root.apply(root.segmentAt(mouse.x, mouse.y))
-        root.disarm()
+        root.softDisarm()
       }
     }
 
     Item {
       id: keys
-      focus: root.keyboardMode
+      focus: root.keyboardMode && !root.optionsOpen
       Keys.onPressed: (event) => {
         if (event.key === Qt.Key_Escape) root.disarm()
         else if (event.key === Qt.Key_Left || event.key === Qt.Key_Up) wheel_.step(-1)
@@ -260,7 +315,7 @@ Item {
         else if (event.key === Qt.Key_Tab) root.nextMode(1)
         else if (event.key === Qt.Key_Backtab) root.nextMode(-1)
         else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
-          if (root.apply(wheel_.hoveredIndex)) root.disarm()
+          if (root.apply(wheel_.hoveredIndex, (event.modifiers & Qt.ShiftModifier) !== 0)) root.softDisarm()
         } else return
         event.accepted = true
       }
@@ -272,7 +327,7 @@ Item {
       height: implicitHeight
       idleHint: root.keyboardMode ? "Arrows pick · Enter applies\nTab switches · Esc closes"
                                   : "Drop on a segment\nDrop here to cancel"
-      visible: root.wheelPlaced
+      visible: root.wheelPlaced && !root.optionsOpen
       opacity: visible ? 1 : 0
       Behavior on opacity { NumberAnimation { duration: 90 } }
       segments: root.mapped ? root.segments : []
@@ -288,8 +343,37 @@ Item {
       fontFamily: Style.fontFamily || ""
     }
 
+    // A click outside the card cancels.
+    MouseArea {
+      anchors.fill: parent
+      enabled: root.optionsOpen
+      onClicked: root.disarm()
+    }
+
+    OptionsCard {
+      id: optionsCard
+      service: root.service
+      maxHeight: window.height * 0.8
+      x: Math.max(8, Math.min(window.width - width - 8, wheel_.x + wheel_.cx - width / 2))
+      y: Math.max(8, Math.min(window.height - height - 8, wheel_.y + wheel_.cy - height / 2))
+      accent: "#4a9eff"
+      background: Color.background ? Qt.rgba(Color.background.r, Color.background.g, Color.background.b, 1) : "#101315"
+      foreground: Color.foreground || "#cacccc"
+      dim: Color.muted || "#707880"
+      warn: "#e8a64a"
+      fontFamily: Style.fontFamily || ""
+      onCancelRequested: root.disarm()
+      onRunRequested: (opts, saved) => {
+        root.service.enqueue("tools", optionsCard.toolId, optionsCard.toolLabel, optionsCard.order, opts)
+        var keys = Object.keys(saved)
+        for (var i = 0; i < keys.length; i++) root.service.setConfig("tools." + keys[i], saved[keys[i]])
+        root.disarm()
+      }
+    }
+
     DropArea {
       anchors.fill: parent
+      enabled: !root.optionsOpen
       keys: ["text/uri-list"]
 
       onEntered: (drag) => {
@@ -324,7 +408,7 @@ Item {
         else event.accepted = false
         if (index >= 0 && root.segments[index] && root.paths.length) root.apply(index)
         // Unmap after the drop handshake has gone out, not under it.
-        Qt.callLater(root.disarm)
+        Qt.callLater(root.softDisarm)
       }
     }
   }

@@ -14,6 +14,8 @@ The file is `$XDG_CONFIG_HOME/peel/config.json`, default `~/.config/peel/config.
 
 `advanced` is a flat map from a dotted field key to a value. An absent key means "use the preset's value".
 
+`tools` is a flat map of saved tool option overrides (for example `"rotate.angle": 180`); an absent key means the field's default. Its schema (`registry/tool-options.json`), `options.tools` and `effectiveTools` in `peel config --json`, and the page-selection grammar are in [tool-options.md](tool-options.md).
+
 ## `peel config --json`
 
 ```json
@@ -52,6 +54,7 @@ Field types are `integer` (min, max, step, unit), `enum` (choices of `{value, la
 | `keys.<wheel>` | one of `options.keys`; no two wheels may share a key, except `off` |
 | `quality` | `high` \| `balanced` \| `small` |
 | `advanced.<field key>` | an integer in range, an enum value, `true`/`false`, or `default` to remove the override |
+| `tools.<field key>` | a value valid for that field (see [tool-options.md](tool-options.md)), or `default` to remove the override; `remember: false` fields and unknown keys are refused |
 | `output.location` | `beside` \| `folder` |
 | `output.folder` | an absolute path to an existing, writable directory |
 

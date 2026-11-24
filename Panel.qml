@@ -36,6 +36,7 @@ Panel {
   property int selectedIndex: 0
   property bool cursorActive: false
   //   quality, output, folder, advanced, adv:<field key>, resetall   settings rows
+  //   tooloptions, tool:<field key>, toolresetall                      tool option rows
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -123,6 +124,10 @@ Panel {
   readonly property string folder: cfg.output && cfg.output.folder ? String(cfg.output.folder) : ""
   readonly property bool folderMode: location === "folder"
   readonly property var overriddenKeys: Object.keys(overrides)
+  readonly property var toolFieldsAll: peel && peel.options && peel.options.tools ? peel.options.tools : []
+  readonly property var toolOverrides: cfg.tools ? cfg.tools : ({})
+  readonly property var toolOverriddenKeys: Object.keys(toolOverrides)
+  readonly property var toolEffective: peel && peel.effectiveTools ? peel.effectiveTools : ({})
   readonly property string qualityDescription: {
     for (var i = 0; i < qualityOptions.length; i++)
       if (qualityOptions[i].id === quality) return qualityOptions[i].description || ""
@@ -131,6 +136,57 @@ Panel {
 
   // In-memory only.
   property bool advancedOpen: false
+  property bool toolOptionsOpen: false
+
+  readonly property var toolLabels: ({
+    "split-pdf": "Split pages", "rotate": "Rotate", "resize-half": "Resize",
+    "compress": "Compress", "snapshot": "Snapshot", "trim-silence": "Trim silence"
+  })
+
+  function toolValueByKey(key) {
+    if (Object.prototype.hasOwnProperty.call(toolOverrides, key)) return toolOverrides[key]
+    if (toolEffective[key] !== undefined) return toolEffective[key]
+    for (var i = 0; i < toolFieldsAll.length; i++) if (toolFieldsAll[i].key === key) return toolFieldsAll[i].default
+    return undefined
+  }
+
+  // Tool fields that are remembered and currently visible, each tagged ns: "tools".
+  readonly property var toolFields: {
+    var out = []
+    for (var i = 0; i < toolFieldsAll.length; i++) {
+      var f = toolFieldsAll[i]
+      if (f.remember !== true) continue
+      if (f.showWhen) {
+        var cur = String(toolValueByKey(f.showWhen.key))
+        var allowed = f.showWhen.in || []
+        var ok = false
+        for (var j = 0; j < allowed.length; j++) if (String(allowed[j]) === cur) ok = true
+        if (!ok) continue
+      }
+      var copy = {}
+      for (var k in f) copy[k] = f[k]
+      copy.ns = "tools"
+      out.push(copy)
+    }
+    return out
+  }
+
+  // [{ name, fields: [...] }]: "General" for ask, then one group per tool.
+  readonly property var toolGroups: {
+    var groups = [], byName = {}
+    for (var i = 0; i < toolFields.length; i++) {
+      var f = toolFields[i]
+      var g = f.tool ? (toolLabels[f.tool] || f.tool) : "General"
+      if (!(g in byName)) {
+        byName[g] = { name: g, fields: [] }
+        if (g === "General") groups.unshift(byName[g]); else groups.push(byName[g])
+      }
+      byName[g].fields.push(f)
+    }
+    return groups
+  }
+
+  function isTool(field) { return field.ns === "tools" }
 
   // Fields grouped in option order: [{ name, fields: [...] }]
   readonly property var advancedGroups: {
@@ -145,10 +201,11 @@ Panel {
   }
 
   function isOverridden(field) {
-    return Object.prototype.hasOwnProperty.call(overrides, field.key)
+    return Object.prototype.hasOwnProperty.call(isTool(field) ? toolOverrides : overrides, field.key)
   }
 
   function effectiveValue(field) {
+    if (isTool(field)) return toolValueByKey(field.key)
     if (isOverridden(field)) return overrides[field.key]
     return field.presets ? field.presets[quality] : undefined
   }
@@ -173,11 +230,11 @@ Panel {
   }
 
   function setField(field, value) {
-    if (peel) peel.setConfig("advanced." + field.key, String(value))
+    if (peel) peel.setConfig((isTool(field) ? "tools." : "advanced.") + field.key, String(value))
   }
 
   function resetField(field) {
-    if (peel && isOverridden(field)) peel.setConfig("advanced." + field.key, "default")
+    if (peel && isOverridden(field)) peel.setConfig((isTool(field) ? "tools." : "advanced.") + field.key, "default")
   }
 
   function stepField(field, dir) {
@@ -199,25 +256,35 @@ Panel {
     return null
   }
 
-  // Reset all: setConfig ignores calls while one runs, so a timer re-issues the
+  function toolFieldByKey(key) {
+    for (var i = 0; i < toolFields.length; i++) if (toolFields[i].key === key) return toolFields[i]
+    return null
+  }
+
+  // Reset all: setConfig queues calls, but a timer re-issues the
   // first override that is still present until none are left.
-  property bool resetting: false
+  property string resetting: ""   // "", "advanced" or "tools"
   Timer {
     id: resetTimer
     interval: 150
     repeat: true
-    running: root.resetting
+    running: root.resetting !== ""
     onTriggered: {
-      if (!root.peel || root.peel.bindsError !== "" || root.overriddenKeys.length === 0) {
-        root.resetting = false
+      var keys = root.resetting === "tools" ? root.toolOverriddenKeys : root.overriddenKeys
+      if (!root.peel || root.peel.bindsError !== "" || keys.length === 0) {
+        root.resetting = ""
         return
       }
-      root.peel.setConfig("advanced." + root.overriddenKeys[0], "default")
+      root.peel.setConfig((root.resetting === "tools" ? "tools." : "advanced.") + keys[0], "default")
     }
   }
 
   function resetAll() {
-    if (peel && overriddenKeys.length > 0) resetting = true
+    if (peel && overriddenKeys.length > 0) resetting = "advanced"
+  }
+
+  function resetAllTools() {
+    if (peel && toolOverriddenKeys.length > 0) resetting = "tools"
   }
 
   function chooseFolder() {
@@ -252,25 +319,35 @@ Panel {
       for (var i = 0; i < advancedFields.length; i++) list.push("adv:" + advancedFields[i].key)
       if (overriddenKeys.length > 0) list.push("resetall")
     }
+    if (toolFieldsAll.length > 0) {
+      list.push("tooloptions")
+      if (toolOptionsOpen) {
+        for (var t = 0; t < toolFields.length; t++) list.push("tool:" + toolFields[t].key)
+        if (toolOverriddenKeys.length > 0) list.push("toolresetall")
+      }
+    }
     list.push("recent")
     return list
   }
   onSectionsChanged: {
     if (sections.length && sections.indexOf(focusSection) < 0) {
-      focusSection = "advanced"
+      focusSection = (focusSection.indexOf("tool") === 0 && sections.indexOf("tooloptions") >= 0) ? "tooloptions" : "advanced"
       selectedIndex = 0
     }
   }
 
   function sectionField(section) {
-    return section.indexOf("adv:") === 0 ? fieldByKey(section.substring(4)) : null
+    if (section.indexOf("adv:") === 0) return fieldByKey(section.substring(4))
+    if (section.indexOf("tool:") === 0) return toolFieldByKey(section.substring(5))
+    return null
   }
 
   function sectionCount(section) {
     if (section === "recent") return recent.length
     if (section === "quality") return qualityOptions.length
     if (section === "output") return locationOptions.length
-    if (section === "folder" || section === "advanced" || section === "resetall") return 1
+    if (section === "folder" || section === "advanced" || section === "resetall"
+        || section === "tooloptions" || section === "toolresetall") return 1
     var f = sectionField(section)
     if (f) return isChips(f) ? (f.choices || []).length : 1
     return keyOptions.length
@@ -288,7 +365,8 @@ Panel {
     }
     var f = sectionField(section)
     if (f) return isChips(f) ? choiceIndex(f, effectiveValue(f)) : 0
-    if (section === "folder" || section === "advanced" || section === "resetall") return 0
+    if (section === "folder" || section === "advanced" || section === "resetall"
+        || section === "tooloptions" || section === "toolresetall") return 0
     return Math.max(0, keyOptions.indexOf(keys[section]))
   }
 
@@ -350,6 +428,10 @@ Panel {
       advancedOpen = !advancedOpen
     } else if (s === "resetall") {
       resetAll()
+    } else if (s === "tooloptions") {
+      toolOptionsOpen = !toolOptionsOpen
+    } else if (s === "toolresetall") {
+      resetAllTools()
     } else if (f) {
       if (isChips(f)) setField(f, f.choices[selectedIndex].value)
       else if (f.type === "boolean") setField(f, !effectiveValue(f))
@@ -722,7 +804,54 @@ Panel {
             visible: root.overriddenKeys.length > 0
             width: column.width
             section: "resetall"
-            title: root.resetting ? "Resetting…" : "Reset all to preset"
+            title: root.resetting === "advanced" ? "Resetting…" : "Reset all to preset"
+          }
+        }
+
+        // ---------- Tool options ----------
+        DisclosureRow {
+          visible: root.peel !== null && root.toolFieldsAll.length > 0
+          width: column.width
+          section: "tooloptions"
+          title: "Tool options"
+          caption: root.toolOverriddenKeys.length > 0 ? root.toolOverriddenKeys.length + " customised" : "Defaults for each tool"
+          expanded: root.toolOptionsOpen
+          onActivated: root.toolOptionsOpen = !root.toolOptionsOpen
+        }
+
+        Column {
+          visible: root.peel !== null && root.toolOptionsOpen
+          width: column.width
+          spacing: Style.space(6)
+
+          Repeater {
+            model: root.toolOptionsOpen ? root.toolGroups : []
+
+            Column {
+              id: toolGroup
+              required property var modelData
+              width: column.width
+              spacing: Style.space(4)
+
+              SmallHeader { text: toolGroup.modelData.name }
+
+              Repeater {
+                model: toolGroup.modelData.fields
+                FieldRow {
+                  required property var modelData
+                  field: modelData
+                  width: column.width
+                }
+              }
+            }
+          }
+
+          ActionRowLite {
+            visible: root.toolOverriddenKeys.length > 0
+            width: column.width
+            section: "toolresetall"
+            title: root.resetting === "tools" ? "Resetting…" : "Reset all tool options"
+            tools: true
           }
         }
 
@@ -907,7 +1036,7 @@ Panel {
   component FieldRow: CursorSurface {
     id: fr
     required property var field
-    readonly property string section: "adv:" + field.key
+    readonly property string section: (root.isTool(field) ? "tool:" : "adv:") + field.key
     readonly property bool overridden: root.isOverridden(field)
     readonly property var value: root.effectiveValue(field)
     readonly property color valueColor: overridden ? root.peelBlue : root.dim
@@ -1041,6 +1170,7 @@ Panel {
     id: arl
     property string section: ""
     property string title: ""
+    property bool tools: false
     hasCursor: root.cursorAt(arl.section, 0)
     onHasCursorChanged: if (arl.hasCursor) root.scrollItemIntoView(arl)
     foreground: root.foreground
@@ -1061,7 +1191,7 @@ Panel {
       hoverEnabled: true
       cursorShape: Qt.PointingHandCursor
       onEntered: root.setCursor(arl.section, 0)
-      onClicked: root.resetAll()
+      onClicked: arl.tools ? root.resetAllTools() : root.resetAll()
     }
   }
 }

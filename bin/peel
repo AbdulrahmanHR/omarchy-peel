@@ -879,6 +879,30 @@ ADVANCED_FIELDS = [
 ]
 FIELD_BY_KEY = {f["key"]: f for f in ADVANCED_FIELDS}
 
+# Tool options: the schema is shared with bin/peel-tool (docs/tool-options.md).
+TOOL_FIELDS = json.loads((ROOT / "registry" / "tool-options.json").read_text())["fields"]
+TOOL_FIELD_BY_KEY = {f["key"]: f for f in TOOL_FIELDS}
+PAGE_ITEM = re.compile(r"\s*(?:\d{1,9}(?:\s*-\s*(?:\d{1,9}|end|last)(?:\s*:\s*\d{1,9})?)?|end|last|odd|even)\s*",
+                       re.IGNORECASE)
+
+
+def check_pages(text):
+    """Syntax check of a page selection (grammar: docs/tool-options.md). The one place
+    bin/peel validates the pages type; resolving against a page count is bin/peel-tool's job."""
+    if not isinstance(text, str):
+        raise PeelError("pages must be text")
+    if len(text) > 500:
+        raise PeelError("pages is longer than 500 characters")
+    if not text.strip():
+        return ""
+    items = text.split(",")
+    if len(items) > 200:
+        raise PeelError("pages has more than 200 items")
+    for item in items:
+        if not PAGE_ITEM.fullmatch(item) or any(int(n) < 1 for n in re.findall(r"\d+", item)):
+            raise PeelError(f"bad page selection '{item.strip()}' (use e.g. 1-3, 5, 8-end)")
+    return text
+
 
 def config_path():
     base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
@@ -887,7 +911,7 @@ def config_path():
 
 def default_config():
     return {"version": 1, "keys": dict(DEFAULT_KEYS), "quality": "balanced",
-            "output": {"location": "beside", "folder": ""}, "advanced": {}}
+            "output": {"location": "beside", "folder": ""}, "advanced": {}, "tools": {}}
 
 
 def check_keys(keys):
@@ -908,7 +932,9 @@ def check_keys(keys):
 def check_value(field, value):
     """Validate a stored (already typed) value for field; returns it or raises PeelError."""
     key, kind = field["key"], field["type"]
-    if kind == "boolean":
+    if kind == "pages":
+        check_pages(value)
+    elif kind == "boolean":
         if not isinstance(value, bool):
             raise PeelError(f"{key} must be true or false")
     elif kind == "integer":
@@ -924,6 +950,8 @@ def check_value(field, value):
 def parse_value(field, text):
     """Turn command line text into a typed value for field, validated."""
     kind = field["type"]
+    if kind == "pages":
+        return check_value(field, text)
     if kind == "boolean":
         if text not in ("true", "false"):
             raise PeelError(f"{field['key']} must be true or false")
@@ -1005,7 +1033,31 @@ def load_config():
             config["advanced"][key] = check_value(field, value)
         except PeelError as error:
             warn_config(path, str(error))
+
+    tools = data.get("tools", {})
+    if not isinstance(tools, dict):
+        warn_config(path, "'tools' must be an object")
+        tools = {}
+    for key, value in tools.items():
+        field = TOOL_FIELD_BY_KEY.get(key)
+        if not field:
+            warn_config(path, f"unknown tools setting '{key}'")
+            continue
+        if not field["remember"]:
+            warn_config(path, f"tools.{key} is not saved between runs")
+            continue
+        if key == "ask" and value == "split":  # the old name of "pdf"
+            value = "pdf"
+        try:
+            config["tools"][key] = check_value(field, value)
+        except PeelError as error:
+            warn_config(path, str(error))
     return config
+
+
+def effective_tools(config):
+    """Every remembered tool option: the override, else the field default."""
+    return {f["key"]: config["tools"].get(f["key"], f["default"]) for f in TOOL_FIELDS if f["remember"]}
 
 
 def effective_settings(config):
@@ -1034,7 +1086,7 @@ def write_config(config):
 
 
 SET_USAGE = ("usage: peel config set NAME VALUE (NAME: keys.<wheel>, quality, "
-             "advanced.<field>, output.location, output.folder)")
+             "advanced.<field>, tools.<option>, output.location, output.folder)")
 
 
 def apply_setting(config, target, value):
@@ -1055,6 +1107,19 @@ def apply_setting(config, target, value):
             config["advanced"].pop(rest, None)
         else:
             config["advanced"][rest] = parse_value(field, value)
+    elif section == "tools" and rest:
+        field = TOOL_FIELD_BY_KEY.get(rest)
+        if not field:
+            raise PeelError(f"unknown tools setting '{rest}' (expected one of: "
+                            f"{', '.join(f['key'] for f in TOOL_FIELDS if f['remember'])})")
+        if not field["remember"]:
+            raise PeelError(f"tools.{rest} is not saved between runs")
+        if rest == "ask" and value == "split":
+            value = "pdf"
+        if value == "default":
+            config["tools"].pop(rest, None)
+        else:
+            config["tools"][rest] = parse_value(field, value)
     elif target == "output.location":
         if value not in [o["value"] for o in OUTPUT_LOCATIONS]:
             raise PeelError("output.location must be beside or folder")
@@ -1084,9 +1149,9 @@ def cmd_config(rest, as_json):
     effective = effective_settings(config)
     if as_json:
         print(json.dumps({
-            "config": config, "effective": effective,
+            "config": config, "effective": effective, "effectiveTools": effective_tools(config),
             "options": {"keys": ALLOWED_KEYS, "quality": QUALITIES, "advanced": ADVANCED_FIELDS,
-                        "output": {"location": OUTPUT_LOCATIONS}},
+                        "tools": TOOL_FIELDS, "output": {"location": OUTPUT_LOCATIONS}},
             "path": str(config_path())}))
     else:
         for wheel in WHEELS:
@@ -1097,6 +1162,9 @@ def cmd_config(rest, as_json):
         for key, value in effective.items():
             mark = "" if key in config["advanced"] else " (preset)"
             print(f"advanced.{key} = {json.dumps(value)}{mark}")
+        for key, value in effective_tools(config).items():
+            mark = "" if key in config["tools"] else " (default)"
+            print(f"tools.{key} = {json.dumps(value)}{mark}")
     return 0
 
 

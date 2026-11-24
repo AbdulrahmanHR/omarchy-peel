@@ -1,0 +1,274 @@
+{
+  "version": 1,
+  "fields": [
+    {
+      "key": "ask",
+      "tool": "",
+      "label": "Ask before running",
+      "type": "enum",
+      "default": "pdf",
+      "remember": true,
+      "description": "When the options card opens before a tool runs",
+      "choices": [
+        {
+          "value": "pdf",
+          "label": "Split and Merge PDFs"
+        },
+        {
+          "value": "always",
+          "label": "Every tool with options"
+        },
+        {
+          "value": "never",
+          "label": "Never: use saved settings"
+        }
+      ]
+    },
+    {
+      "key": "split-pdf.mode",
+      "tool": "split-pdf",
+      "label": "Split",
+      "type": "enum",
+      "default": "each",
+      "remember": true,
+      "choices": [
+        {
+          "value": "each",
+          "label": "Every page"
+        },
+        {
+          "value": "every",
+          "label": "Every N pages"
+        },
+        {
+          "value": "parts",
+          "label": "Equal parts"
+        },
+        {
+          "value": "ranges",
+          "label": "One file per range"
+        },
+        {
+          "value": "extract",
+          "label": "Pages into one PDF"
+        },
+        {
+          "value": "remove",
+          "label": "Remove pages"
+        }
+      ]
+    },
+    {
+      "key": "split-pdf.every",
+      "tool": "split-pdf",
+      "label": "Pages per file",
+      "type": "integer",
+      "default": 2,
+      "min": 1,
+      "max": 500,
+      "step": 1,
+      "unit": "",
+      "remember": true,
+      "showWhen": {
+        "key": "split-pdf.mode",
+        "in": [
+          "every"
+        ]
+      }
+    },
+    {
+      "key": "split-pdf.parts",
+      "tool": "split-pdf",
+      "label": "Number of parts",
+      "type": "integer",
+      "default": 2,
+      "min": 2,
+      "max": 100,
+      "step": 1,
+      "unit": "",
+      "remember": true,
+      "showWhen": {
+        "key": "split-pdf.mode",
+        "in": [
+          "parts"
+        ]
+      }
+    },
+    {
+      "key": "split-pdf.pages",
+      "tool": "split-pdf",
+      "label": "Pages",
+      "type": "pages",
+      "default": "",
+      "remember": false,
+      "placeholder": "All pages, or e.g. 1-3, 5, 8-end"
+    },
+    {
+      "key": "split-pdf.folder",
+      "tool": "split-pdf",
+      "label": "Put files in a folder",
+      "type": "boolean",
+      "default": false,
+      "remember": true
+    },
+    {
+      "key": "merge-pdf.mode",
+      "tool": "merge-pdf",
+      "label": "Merge",
+      "type": "enum",
+      "default": "append",
+      "remember": true,
+      "choices": [
+        {
+          "value": "append",
+          "label": "One after another"
+        },
+        {
+          "value": "insert",
+          "label": "Insert into the first PDF"
+        }
+      ]
+    },
+    {
+      "key": "merge-pdf.at",
+      "tool": "merge-pdf",
+      "label": "After page",
+      "type": "integer",
+      "default": 0,
+      "min": 0,
+      "max": 99999,
+      "step": 1,
+      "unit": "",
+      "remember": false,
+      "description": "0 puts them before page 1",
+      "showWhen": {
+        "key": "merge-pdf.mode",
+        "in": [
+          "insert"
+        ]
+      }
+    },
+    {
+      "key": "merge-pdf.pages",
+      "tool": "merge-pdf",
+      "label": "Pages",
+      "type": "pages",
+      "default": "",
+      "remember": false,
+      "perFile": true,
+      "placeholder": "All"
+    },
+    {
+      "key": "rotate.angle",
+      "tool": "rotate",
+      "label": "Angle",
+      "type": "enum",
+      "default": 90,
+      "remember": true,
+      "choices": [
+        {
+          "value": 90,
+          "label": "90° clockwise"
+        },
+        {
+          "value": 180,
+          "label": "180°"
+        },
+        {
+          "value": 270,
+          "label": "90° counter-clockwise"
+        }
+      ]
+    },
+    {
+      "key": "rotate.pages",
+      "tool": "rotate",
+      "label": "Pages",
+      "type": "pages",
+      "default": "",
+      "remember": false,
+      "kinds": [
+        "pdf"
+      ],
+      "placeholder": "All pages"
+    },
+    {
+      "key": "resize-half.scale",
+      "tool": "resize-half",
+      "label": "Scale",
+      "type": "enum",
+      "default": 50,
+      "remember": true,
+      "choices": [
+        {
+          "value": 25,
+          "label": "25%"
+        },
+        {
+          "value": 50,
+          "label": "50%"
+        },
+        {
+          "value": 75,
+          "label": "75%"
+        }
+      ]
+    },
+    {
+      "key": "compress.level",
+      "tool": "compress",
+      "label": "Level",
+      "type": "enum",
+      "default": "medium",
+      "remember": true,
+      "choices": [
+        {
+          "value": "light",
+          "label": "Light"
+        },
+        {
+          "value": "medium",
+          "label": "Medium"
+        },
+        {
+          "value": "strong",
+          "label": "Strong"
+        }
+      ]
+    },
+    {
+      "key": "snapshot.at",
+      "tool": "snapshot",
+      "label": "Position in video",
+      "type": "integer",
+      "default": 10,
+      "min": 0,
+      "max": 100,
+      "step": 5,
+      "unit": "%",
+      "remember": true
+    },
+    {
+      "key": "trim-silence.threshold",
+      "tool": "trim-silence",
+      "label": "Silence threshold",
+      "type": "enum",
+      "default": -50,
+      "remember": true,
+      "choices": [
+        {
+          "value": -60,
+          "label": "-60 dB"
+        },
+        {
+          "value": -50,
+          "label": "-50 dB"
+        },
+        {
+          "value": -40,
+          "label": "-40 dB"
+        }
+      ]
+    }
+  ]
+}

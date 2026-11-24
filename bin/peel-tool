@@ -2,7 +2,9 @@
 """Peel tools: one-click fixed-preset operations on files, offline.
 
     peel-tool targets --json -- FILE...
-    peel-tool run --tool ID [--progress] [--notify] -- FILE...
+    peel-tool info --json -- FILE...
+    peel-tool check --json --tool ID [--opt KEY=VALUE]... -- FILE...
+    peel-tool run --tool ID [--opt KEY=VALUE]... [--progress] [--notify] -- FILE...
 
 Output is always a new file next to the input ("photo (compressed).jpg",
 "photo (compressed) (1).jpg" when taken); the source is never touched.
@@ -15,6 +17,7 @@ file protocol, work done in a temp file with a name no user input reaches.
 
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -25,6 +28,12 @@ from pathlib import Path
 
 MEMORY_MAX = "4G"
 PEEL = Path(__file__).resolve().parent / "peel"
+OPTION_FIELDS = json.loads((Path(__file__).resolve().parent.parent / "registry" / "tool-options.json")
+                           .read_text())["fields"]
+FIELD_BY_KEY = {f["key"]: f for f in OPTION_FIELDS}
+MAX_OUTPUTS = 2000
+MAX_REFS = 10000
+LOSSY_AUDIO = {"mp3", "opus", "ogg", "m4a", "wma"}
 # ffprobe format names of demuxers that open other files or URLs named inside
 # the input (playlists, concat scripts, device and network inputs).
 UNSAFE_DEMUXERS = {"concat", "hls", "applehttp", "dash", "m3u8", "ffmetadata", "tee",
@@ -50,8 +59,8 @@ MUXER = {"mp4": "mp4", "m4v": "mp4", "mov": "mov", "mkv": "matroska", "webm": "w
 TOOLS = {
     "compress": ("Compress", {"image", "video", "audio", "pdf"}, "compressed"),
     "strip-metadata": ("Remove info", {"image", "video", "audio", "pdf"}, "no info"),
-    "resize-half": ("Half size", {"image", "video"}, "half"),
-    "rotate": ("Rotate", {"image", "video"}, "rotated"),
+    "resize-half": ("Resize", {"image", "video"}, "half"),
+    "rotate": ("Rotate", {"image", "video", "pdf"}, "rotated"),
     "to-grayscale": ("Grayscale", {"image"}, "gray"),
     "trim-silence": ("Trim silence", {"audio"}, "trimmed"),
     "extract-audio": ("Extract audio", {"video"}, None),
@@ -63,7 +72,7 @@ ORDER = {
     "image": ["compress", "resize-half", "strip-metadata", "rotate", "to-grayscale"],
     "video": ["compress", "extract-audio", "snapshot", "resize-half", "strip-metadata", "rotate"],
     "audio": ["compress", "trim-silence", "strip-metadata"],
-    "pdf": ["compress", "merge-pdf", "split-pdf", "strip-metadata"],
+    "pdf": ["compress", "merge-pdf", "split-pdf", "rotate", "strip-metadata"],
 }
 
 
@@ -121,11 +130,236 @@ def tool_ok(tool_id, kinds, count):
     check = tool_available(tool_id)
     if check:
         return all(check(k) for k in set(kinds))
-    bins = {"resize-half": {"image": "magick", "video": "ffmpeg"}, "rotate": {"image": "magick", "video": "ffmpeg"},
+    bins = {"resize-half": {"image": "magick", "video": "ffmpeg"}, "rotate": {"image": "magick", "video": "ffmpeg", "pdf": "qpdf"},
             "to-grayscale": {"image": "magick"}, "trim-silence": {"audio": "ffmpeg"},
             "extract-audio": {"video": "ffmpeg"}, "snapshot": {"video": "ffmpeg"},
             "merge-pdf": {"pdf": "qpdf"}, "split-pdf": {"pdf": "qpdf"}}[tool_id]
     return all(need(bins[k]) for k in set(kinds))
+
+
+# --------------------------------------------------------------- options
+
+PAGE_ITEM = re.compile(r"\s*(?:(\d{1,9})(?:\s*-\s*(\d{1,9}|end|last)(?:\s*:\s*(\d{1,9}))?)?|(end|last|odd|even))\s*",
+                       re.IGNORECASE)
+
+
+def parse_pages(text):
+    """The one place the pages type is validated (grammar: docs/tool-options.md).
+    Returns items (first, last, step): ints, or "end" for last; odd/even are
+    ("odd", None, 1) / ("even", None, 1). A single page N is (N, N, 1).
+    Raises ToolError on bad syntax."""
+    if not isinstance(text, str):
+        raise ToolError("pages must be text")
+    if len(text) > 500:
+        raise ToolError("pages is longer than 500 characters")
+    if not text.strip():
+        return []
+    parts = text.split(",")
+    if len(parts) > 200:
+        raise ToolError("pages has more than 200 items")
+    items = []
+    for part in parts:
+        m = PAGE_ITEM.fullmatch(part)
+        if not m:
+            raise ToolError(f"bad page selection '{part.strip()}' (use e.g. 1-3, 5, 8-end, odd)")
+        if m.group(4):
+            word = m.group(4).lower()
+            items.append(("end", "end", 1) if word in ("end", "last") else (word, None, 1))
+            continue
+        first = int(m.group(1))
+        last = m.group(2)
+        last = first if last is None else ("end" if last.lower() in ("end", "last") else int(last))
+        step = int(m.group(3)) if m.group(3) else 1
+        if first < 1 or last == 0 or step < 1:
+            raise ToolError(f"bad page selection '{part.strip()}': pages and steps start at 1")
+        items.append((first, last, step))
+    return items
+
+
+def resolve_pages(items, count):
+    """One list of page numbers per item, against a PDF of count pages (at most MAX_REFS in all)."""
+    out, total = [], 0
+    for first, last, step in items:
+        if first in ("odd", "even"):
+            pages = range(1 if first == "odd" else 2, count + 1, 2)
+        else:
+            first = count if first == "end" else first
+            last = count if last == "end" else last
+            top = max(first, last)
+            if top > count:
+                raise ToolError(f"page {top} is past the end ({count} pages)")
+            pages = range(first, last + 1, step) if first <= last else range(first, last - 1, -step)
+        total += len(pages)
+        if total > MAX_REFS:
+            raise ToolError(f"that selection is more than {MAX_REFS} pages")
+        out.append(list(pages))
+    return out
+
+
+def parse_option(field, text):
+    key, kind = field["key"], field["type"]
+    if kind == "pages":
+        parse_pages(text)
+        return text
+    if kind == "boolean":
+        if text not in ("true", "false"):
+            raise ToolError(f"{key} must be true or false")
+        return text == "true"
+    if kind == "integer":
+        if not re.fullmatch(r"-?\d{1,9}", text) or not field["min"] <= int(text) <= field["max"]:
+            raise ToolError(f"{key} must be an integer from {field['min']} to {field['max']}")
+        return int(text)
+    for choice in field["choices"]:
+        if str(choice["value"]) == text:
+            return choice["value"]
+    raise ToolError(f"{key} must be one of: {', '.join(str(c['value']) for c in field['choices'])}")
+
+
+def tool_option_keys(tool_id):
+    return [f["key"] for f in OPTION_FIELDS if f["tool"] == tool_id]
+
+
+def resolve_options(tool_id, opt_args, config, nfiles=0):
+    """Every option of tool_id: --opt value, else saved config, else default.
+    A perFile field is given as KEY.<i>=VALUE (i = 1-based FILE position, at most nfiles)
+    and comes back as {i: value}. Raises ToolError on an unknown key or bad value."""
+    keys = tool_option_keys(tool_id)
+    given = {}
+    for arg in opt_args:
+        key, sep, text = arg.partition("=")
+        if not sep:
+            raise ToolError(f"--opt needs KEY=VALUE, got '{arg[:60]}'")
+        base, _, number = key.rpartition(".")
+        if base in keys and FIELD_BY_KEY[base].get("perFile"):
+            if not re.fullmatch(r"[1-9]\d{0,5}", number) or int(number) > nfiles:
+                raise ToolError(f"{key[:60]}: file number must be 1 to {nfiles}")
+            given.setdefault(base, {})[int(number)] = parse_option(FIELD_BY_KEY[base], text)
+            continue
+        if key in keys and FIELD_BY_KEY[key].get("perFile"):
+            raise ToolError(f"{key} needs a file number, e.g. {key}.1=SPEC")
+        if key not in keys:
+            raise ToolError(f"unknown option '{key[:60]}' for {tool_id}" +
+                            (f" (expected one of: {', '.join(keys)})" if keys else " (it has no options)"))
+        given[key] = parse_option(FIELD_BY_KEY[key], text)
+    saved = ((config or {}).get("config") or {}).get("tools")
+    saved = saved if isinstance(saved, dict) else {}
+    opts = {}
+    for key in keys:
+        field = FIELD_BY_KEY[key]
+        if field.get("perFile"):
+            opts[key] = given.get(key, {})
+            continue
+        if key in given:
+            opts[key] = given[key]
+            continue
+        value = field["default"]
+        if field["remember"] and key in saved:
+            try:  # bin/peel already validated it; re-check, never trust the file
+                value = parse_option(field, str(saved[key]).lower() if isinstance(saved[key], bool) else str(saved[key]))
+            except ToolError:
+                value = field["default"]
+        opts[key] = value
+    return opts
+
+
+def saved_ask(config):
+    saved = ((config or {}).get("config") or {}).get("tools")
+    value = saved.get("ask") if isinstance(saved, dict) else None
+    value = "pdf" if value == "split" else value  # the old name of "pdf"
+    return value if value in ("pdf", "always", "never") else FIELD_BY_KEY["ask"]["default"]
+
+
+# --------------------------------------------------------------- split planning
+
+def page_runs(pages):
+    """qpdf page range built from ints only: consecutive runs, up or down, become a-b."""
+    parts, i = [], 0
+    while i < len(pages):
+        j = i
+        if i + 1 < len(pages) and abs(pages[i + 1] - pages[i]) == 1:
+            d = pages[i + 1] - pages[i]
+            j = i + 1
+            while j + 1 < len(pages) and pages[j + 1] - pages[j] == d:
+                j += 1
+        parts.append(str(pages[i]) if i == j else f"{pages[i]}-{pages[j]}")
+        i = j + 1
+    return ",".join(parts)
+
+
+def is_contiguous(pages):
+    return all(b == a + 1 for a, b in zip(pages, pages[1:]))
+
+
+def plan_split(opts, count):
+    """Page lists, one per output file, for the split options and a PDF page count."""
+    mode = opts["split-pdf.mode"]
+    items = parse_pages(opts["split-pdf.pages"])
+    if mode in ("ranges", "extract", "remove") and not items:
+        raise ToolError("enter the pages to use, e.g. 1-3, 5, 8-end")
+    groups = resolve_pages(items, count) if items else [list(range(1, count + 1))]
+    flat = [p for g in groups for p in g]
+    if mode == "each":
+        plan = [[p] for p in flat]
+    elif mode == "every":
+        n = opts["split-pdf.every"]
+        plan = [flat[i:i + n] for i in range(0, len(flat), n)]
+    elif mode == "parts":
+        n, parts = len(flat), opts["split-pdf.parts"]
+        if parts > n:
+            raise ToolError(f"only {n} pages to split into {parts} parts")
+        base, extra = divmod(n, parts)
+        plan, at = [], 0
+        for k in range(parts):
+            size = base + (1 if k < extra else 0)
+            plan.append(flat[at:at + size])
+            at += size
+    elif mode == "ranges":
+        plan = groups
+    elif mode == "remove":
+        gone = set(flat)
+        plan = [[p for p in range(1, count + 1) if p not in gone]]
+        if not plan[0]:
+            raise ToolError("that removes every page")
+    else:
+        plan = [flat]
+    if len(plan) > MAX_OUTPUTS:
+        raise ToolError(f"that makes {len(plan)} files; the limit is {MAX_OUTPUTS}")
+    return plan
+
+
+def split_label(pages, index, mode):
+    if len(pages) == 1:
+        return f"page {pages[0]}"
+    if is_contiguous(pages):
+        return f"pages {pages[0]}-{pages[-1]}"
+    return "selected pages" if mode in ("extract", "remove") else f"part {index}"
+
+
+def split_summary(plan):
+    descs = ["+".join(page_runs(g).split(",")) if len(g) > 1 else str(g[0]) for g in plan]
+    head = "1 PDF" if len(plan) == 1 else f"{len(plan)} PDFs"
+    noun = "page " if len(plan) == 1 and len(plan[0]) == 1 else "pages "
+    text = f"{head}: {noun}" + ", ".join(descs)
+    return text if len(text) <= 120 else text[:119].rstrip(", +") + "…"
+
+
+def pdf_selection(text, src):
+    """Sorted unique pages a pages option selects in a PDF; [] means all pages."""
+    items = parse_pages(text)
+    if not items:
+        return []
+    return sorted({p for g in resolve_pages(items, pdf_pages(src)) for p in g})
+
+
+def pdf_pages(src):
+    try:
+        count = int(subprocess.run(["qpdf", "--show-npages", str(src)], capture_output=True, text=True,
+                                   timeout=60, stdin=subprocess.DEVNULL).stdout.strip())
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        raise ToolError("cannot read PDF")
+    if count < 1:
+        raise ToolError("PDF has no pages")
+    return count
 
 
 # --------------------------------------------------------------- outputs
@@ -175,11 +409,14 @@ def last_line(text):
     return lines[-1][:300] if lines else ""
 
 
-def run(argv, timeout, stdin=None, stdout=None, on_line=None, ok_codes=(0,)):
-    proc = subprocess.Popen(limited(argv), stdin=stdin or subprocess.DEVNULL,
-                            stdout=stdout or (subprocess.PIPE if on_line else subprocess.DEVNULL),
-                            stderr=subprocess.PIPE, text=on_line is not None,
-                            start_new_session=True)
+def run(argv, timeout, stdin=None, stdout=None, on_line=None, ok_codes=(0,), cwd=None):
+    try:
+        proc = subprocess.Popen(limited(argv), stdin=stdin or subprocess.DEVNULL,
+                                stdout=stdout or (subprocess.PIPE if on_line else subprocess.DEVNULL),
+                                stderr=subprocess.PIPE, text=on_line is not None,
+                                start_new_session=True, cwd=cwd)
+    except OSError as error:
+        raise ToolError(f"cannot start {argv[0]}: {error.strerror or error}")
     try:
         if on_line:
             for line in proc.stdout:
@@ -189,6 +426,13 @@ def run(argv, timeout, stdin=None, stdout=None, on_line=None, ok_codes=(0,)):
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
         raise ToolError("timed out")
+    except BaseException:  # SIGTERM/SIGINT: do not leave the child writing
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        raise
     if proc.returncode not in ok_codes:
         err = err if isinstance(err, str) else err.decode(errors="replace")
         raise ToolError(last_line(err) or f"{argv[0]} exited with {proc.returncode}")
@@ -263,10 +507,10 @@ def run_ffmpeg(src, pre, post, muxer, tmp, report=None, duration=None):
     run(argv, TIMEOUT_SECONDS["ffmpeg"], on_line=on_line)
 
 
-def video_codec_args(out_ext, crf, abr):
+def video_codec_args(out_ext, crf, abr, opus="96k"):
     if out_ext == "webm":
         return ["-c:v", "libvpx-vp9", "-crf", str(crf), "-b:v", "0", "-row-mt", "1",
-                "-c:a", "libopus", "-b:a", "96k"]
+                "-c:a", "libopus", "-b:a", opus]
     args = ["-c:v", "libx264", "-preset", "medium", "-crf", str(crf), "-pix_fmt", "yuv420p",
             "-c:a", "aac", "-b:a", abr]
     if out_ext in ("mp4", "m4v", "mov"):
@@ -290,29 +534,36 @@ VMAP = ["-map", "0:v:0", "-map", "0:a?", "-sn", "-dn", "-map_metadata", "0"]
 
 # --------------------------------------------------------------- tools
 
-def do_compress(src, kind, ext, tmp, report):
+COMPRESS = {  # level -> (image quality, max side, video crf, aac/mp3 bitrate, opus bitrate, gs preset)
+    "light": (85, 3840, 23, "160k", "128k", "/printer"),
+    "medium": (75, 2560, 28, "128k", "96k", "/ebook"),
+    "strong": (60, 1920, 33, "96k", "64k", "/screen"),
+}
+
+
+def do_compress(src, kind, ext, tmp, report, opts):
+    quality, side, crf, abr, opus, gs_preset = COMPRESS[opts["compress.level"]]
     if kind == "image":
-        run_magick(src, ext, ["-strip", "-resize", "2560x2560>", "-quality", "75"], ext, tmp)
+        run_magick(src, ext, ["-strip", "-resize", f"{side}x{side}>", "-quality", str(quality)], ext, tmp)
     elif kind == "video":
         out = video_out_ext(ext)
-        crf = 38 if out == "webm" else 28
-        run_ffmpeg(src, [], VMAP + ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"] + video_codec_args(out, crf, "128k"),
-                   MUXER[out], tmp, report)
+        run_ffmpeg(src, [], VMAP + ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2"]
+                   + video_codec_args(out, crf + 10 if out == "webm" else crf, abr, opus), MUXER[out], tmp, report)
     elif kind == "audio":
-        codec = {"mp3": ["-c:a", "libmp3lame", "-b:a", "128k"], "opus": ["-c:a", "libopus", "-b:a", "96k"],
-                 "ogg": ["-c:a", "libopus", "-b:a", "96k"], "m4a": ["-c:a", "aac", "-b:a", "128k"],
-                 "wma": ["-c:a", "wmav2", "-b:a", "128k"]}.get(ext)
+        codec = None if ext not in LOSSY_AUDIO else {"mp3": ["-c:a", "libmp3lame", "-b:a", abr], "opus": ["-c:a", "libopus", "-b:a", opus],
+                 "ogg": ["-c:a", "libopus", "-b:a", opus], "m4a": ["-c:a", "aac", "-b:a", abr],
+                 "wma": ["-c:a", "wmav2", "-b:a", abr]}[ext]
         if not codec:
             raise Skip("lossless audio, nothing to compress")
         run_ffmpeg(src, [], ["-vn", "-sn", "-dn", "-map", "0:a:0", "-map_metadata", "0"] + codec,
                    MUXER[ext], tmp, report)
     else:
-        run(["gs", "-sDEVICE=pdfwrite", "-dPDFSETTINGS=/ebook", "-dCompatibilityLevel=1.5", "-dSAFER",
-             "-dBATCH", "-dNOPAUSE", "-dQUIET", f"-sOutputFile={tmp}", "-f", str(src)],
-            TIMEOUT_SECONDS["gs"])
+        run(["gs", "-sDEVICE=pdfwrite", f"-dPDFSETTINGS={gs_preset}", "-dCompatibilityLevel=1.5", "-dSAFER",
+             "-dBATCH", "-dNOPAUSE", "-dQUIET", f"-sOutputFile={tmp.name}", "-f", str(src)],
+            TIMEOUT_SECONDS["gs"], cwd=tmp.parent)  # % in a directory path would be a gs format
 
 
-def do_strip(src, kind, ext, tmp, report):
+def do_strip(src, kind, ext, tmp, report, opts):
     if kind == "image":
         run_magick(src, ext, ["-strip"], ext, tmp)
     elif kind == "pdf":
@@ -324,36 +575,49 @@ def do_strip(src, kind, ext, tmp, report):
                              "-c", "copy"], MUXER[ext], tmp, report)
 
 
-def do_resize(src, kind, ext, tmp, report):
+RESIZE_NUM = {25: "8", 50: "4", 75: "8/3"}  # video: iw/NUM
+
+
+def do_resize(src, kind, ext, tmp, report, opts):
+    scale = opts["resize-half.scale"]
     if kind == "image":
-        run_magick(src, ext, ["-resize", "50%"], ext, tmp)
+        run_magick(src, ext, ["-resize", f"{scale}%"], ext, tmp)
     else:
         out = video_out_ext(ext)
-        run_ffmpeg(src, [], VMAP + ["-vf", "scale=trunc(iw/4)*2:trunc(ih/4)*2"]
+        div = RESIZE_NUM[scale]
+        run_ffmpeg(src, [], VMAP + ["-vf", f"scale=trunc(iw/{div})*2:trunc(ih/{div})*2"]
                    + video_codec_args(out, 32 if out == "webm" else 23, "160k"), MUXER[out], tmp, report)
 
 
-def do_rotate(src, kind, ext, tmp, report):
+TRANSPOSE = {90: "transpose=1", 180: "transpose=1,transpose=1", 270: "transpose=2"}
+
+
+def do_rotate(src, kind, ext, tmp, report, opts):
+    angle = opts["rotate.angle"]
     if kind == "image":
-        run_magick(src, ext, ["-rotate", "90"], ext, tmp)
+        run_magick(src, ext, ["-rotate", str(angle)], ext, tmp)
+    elif kind == "pdf":
+        selection = pdf_selection(opts.get("rotate.pages", ""), src)
+        spec = f"--rotate=+{angle}" + (f":{page_runs(selection)}" if selection else "")
+        run(["qpdf", spec, str(src), str(tmp)], TIMEOUT_SECONDS["qpdf"], ok_codes=(0, 3))
     else:
         out = video_out_ext(ext)
-        run_ffmpeg(src, [], VMAP + ["-vf", "transpose=1,pad=ceil(iw/2)*2:ceil(ih/2)*2"]
+        run_ffmpeg(src, [], VMAP + ["-vf", f"{TRANSPOSE[angle]},pad=ceil(iw/2)*2:ceil(ih/2)*2"]
                    + video_codec_args(out, 32 if out == "webm" else 23, "160k"), MUXER[out], tmp, report)
 
 
-def do_gray(src, kind, ext, tmp, report):
+def do_gray(src, kind, ext, tmp, report, opts):
     run_magick(src, ext, ["-colorspace", "Gray"], ext, tmp)
 
 
-def do_trim(src, kind, ext, tmp, report):
-    edge = "silenceremove=start_periods=1:start_threshold=-50dB:start_silence=0.05"
+def do_trim(src, kind, ext, tmp, report, opts):
+    edge = f"silenceremove=start_periods=1:start_threshold={opts['trim-silence.threshold']}dB:start_silence=0.05"
     run_ffmpeg(src, [], ["-vn", "-sn", "-dn", "-map", "0:a:0", "-map_metadata", "0",
                          "-af", f"{edge},areverse,{edge},areverse"] + audio_lossy_args(ext),
                MUXER[ext], tmp, report)
 
 
-def do_extract_audio(src, kind, ext, tmp, report):
+def do_extract_audio(src, kind, ext, tmp, report, opts):
     codec = probe(src, "stream=codec_name", "a:0")
     if not codec:
         raise ToolError("no audio track")
@@ -362,8 +626,9 @@ def do_extract_audio(src, kind, ext, tmp, report):
                "ipod", tmp, report)
 
 
-def do_snapshot(src, kind, ext, tmp, report):
-    at = probe_duration(src) * 0.1
+def do_snapshot(src, kind, ext, tmp, report, opts):
+    duration = probe_duration(src)
+    at = min(duration * opts["snapshot.at"] / 100, max(0.0, duration - 0.1))
     run_ffmpeg(src, ["-ss", f"{at:.3f}"], ["-map", "0:v:0", "-frames:v", "1", "-c:v", "png", "-update", "1"],
                "image2", tmp, None, duration=0)
 
@@ -381,7 +646,7 @@ SIMPLE = {
 }
 
 
-def run_simple(tool_id, src, report, outdir=None):
+def run_simple(tool_id, src, report, outdir=None, opts=None):
     kind = kind_of(src)
     if kind not in TOOLS[tool_id][1]:
         raise ToolError(f"{TOOLS[tool_id][0]} does not apply to this file type")
@@ -398,7 +663,7 @@ def run_simple(tool_id, src, report, outdir=None):
     stem = f"{src.stem} ({suffix})" if suffix else src.stem
     tmp = temp_path(directory, out_ext)
     try:
-        func(src, kind, ext_of(src), tmp, report)
+        func(src, kind, ext_of(src), tmp, report, opts or {})
         if not tmp.exists() or tmp.stat().st_size == 0:
             raise ToolError("tool produced no output")
         return [publish(tmp, directory, stem, out_ext)]
@@ -406,47 +671,101 @@ def run_simple(tool_id, src, report, outdir=None):
         tmp.unlink(missing_ok=True)
 
 
-def run_split(src, report, outdir=None):
+def make_folder(directory, stem):
+    n = 0
+    while True:
+        path = directory / (f"{stem} (split)" if n == 0 else f"{stem} (split) ({n})")
+        try:
+            path.mkdir()
+            return path
+        except FileExistsError:
+            n += 1
+
+
+def run_split(src, report, outdir, opts):
     if kind_of(src) != "pdf":
         raise ToolError("Split pages only applies to PDFs")
     directory = outdir or src.parent
     if not os.access(directory, os.W_OK):
         raise ToolError(f"cannot write to {directory}")
+    plan = plan_split(opts, pdf_pages(src))
+    mode = opts["split-pdf.mode"]
+    made, folder = [], None
     try:
-        count = int(subprocess.run(["qpdf", "--show-npages", str(src)], capture_output=True, text=True,
-                                   timeout=60, stdin=subprocess.DEVNULL).stdout.strip())
-    except (ValueError, OSError, subprocess.TimeoutExpired):
-        raise ToolError("cannot read PDF")
-    if count < 1:
-        raise ToolError("PDF has no pages")
-    made = []
-    try:
-        for page in range(1, count + 1):
+        if opts["split-pdf.folder"] and len(plan) > 1:
+            folder = make_folder(directory, src.stem)
+            directory = folder
+        for index, pages in enumerate(plan, 1):
             tmp = temp_path(directory, "pdf")
             try:
-                run(["qpdf", "--empty", "--pages", str(src), str(page), "--", str(tmp)],
+                # Ranges are built from ints; the user's text never reaches argv.
+                run(["qpdf", "--empty", "--pages", str(src), page_runs(pages), "--", str(tmp)],
                     TIMEOUT_SECONDS["qpdf"], ok_codes=(0, 3))
                 if not tmp.exists() or tmp.stat().st_size == 0:
                     raise ToolError("tool produced no output")
-                made.append(publish(tmp, directory, f"{src.stem} (page {page})", "pdf"))
+                made.append(publish(tmp, directory, f"{src.stem} ({split_label(pages, index, mode)})", "pdf"))
             finally:
                 tmp.unlink(missing_ok=True)
-            report(page / count * 100)
+            report(index / len(plan) * 100)
     except BaseException:
         for path in made:
             path.unlink(missing_ok=True)
+        if folder:
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
         raise
     return made
 
 
-def run_merge(sources, outdir=None):
+def plan_merge(sources, opts):
+    """qpdf pieces [(path, [pages])] and a summary, for the merge options.
+    Per-file selections count together against MAX_REFS; errors name the file."""
+    chosen, total_refs, counts = [], 0, []
+    for position, src in enumerate(sources, 1):
+        try:
+            count = pdf_pages(src)
+            text = opts["merge-pdf.pages"].get(position, "")
+            items = parse_pages(text)
+            if items:
+                pages = [p for g in resolve_pages(items, count) for p in g]
+                total_refs += len(pages)
+                if total_refs > MAX_REFS:
+                    raise ToolError(f"the selections are more than {MAX_REFS} pages in all")
+            else:
+                pages = list(range(1, count + 1))
+        except ToolError as error:
+            raise ToolError(f"{src.name}: {error}")
+        chosen.append(pages)
+        counts.append(count)
+    total = sum(len(p) for p in chosen)
+    if opts["merge-pdf.mode"] == "append":
+        pieces = list(zip(sources, chosen))
+        return pieces, f"1 PDF, {total} pages from {len(sources)} files"
+    base, at = chosen[0], opts["merge-pdf.at"]
+    if at > len(base):
+        raise ToolError(f"page {at} is past the end of {sources[0].name} ({len(base)} pages)")
+    pieces = [(sources[0], base[:at])] + list(zip(sources[1:], chosen[1:])) + [(sources[0], base[at:])]
+    pieces = [(src, pages) for src, pages in pieces if pages]
+    inserted = total - len(base)
+    where = f"after page {at}" if at else "before page 1"
+    return pieces, f"1 PDF, {total} pages: {inserted} inserted {where} of {sources[0].name}"
+
+
+def run_merge(sources, outdir=None, pieces=None):
     first = sources[0]
+    if pieces is None:
+        pieces = [(s, list(range(1, pdf_pages(s) + 1))) for s in sources]
     directory = outdir or first.parent
     if not os.access(directory, os.W_OK):
         raise ToolError(f"cannot write to {directory}")
     tmp = temp_path(directory, "pdf")
     try:
-        run(["qpdf", "--empty", "--pages"] + [str(s) for s in sources] + ["--", str(tmp)],
+        argv = ["qpdf", "--empty", "--pages"]
+        for src, pages in pieces:  # ranges are built from ints only
+            argv += [str(src), page_runs(pages)]
+        run(argv + ["--", str(tmp)],
             TIMEOUT_SECONDS["qpdf"], ok_codes=(0, 3))
         if not tmp.exists() or tmp.stat().st_size == 0:
             raise ToolError("tool produced no output")
@@ -468,15 +787,23 @@ def notify(title, body):
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def output_dir(progress):
-    """The configured output folder, or None for beside the source. Asks the
-    sibling bin/peel, which owns the config format; warns once on fallback."""
+def peel_config():
+    """`peel config --json` once per run (None when unavailable); bin/peel owns the format."""
     try:
         proc = subprocess.run([str(PEEL), "config", "--json"], capture_output=True, text=True,
                               timeout=30, stdin=subprocess.DEVNULL)
-        output = json.loads(proc.stdout)["config"]["output"]
+        data = json.loads(proc.stdout)
+        return data if isinstance(data, dict) else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+
+
+def output_dir(progress, config):
+    """The configured output folder, or None for beside the source; warns once on fallback."""
+    try:
+        output = config["config"]["output"]
         location, folder = output["location"], output["folder"]
-    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+    except (KeyError, TypeError):
         return None
     if location != "folder":
         return None
@@ -502,21 +829,115 @@ def available_tools(paths):
     return [t for t in ORDER[kinds[0]] if tool_ok(t, kinds, len(kinds))]
 
 
+def asks(tool_id, ask):
+    return ask == "always" and bool(tool_option_keys(tool_id)) or (ask == "pdf" and tool_id in ("split-pdf", "merge-pdf"))
+
+
 def cmd_targets(args, as_json):
     tools = available_tools([to_path(a) for a in args])
     if as_json:
-        print(json.dumps({"tools": [{"id": t, "label": TOOLS[t][0]} for t in tools]}))
+        config = peel_config()
+        ask = saved_ask(config)
+        needs_pages = resolve_options("split-pdf", [], config)["split-pdf.mode"] in ("ranges", "extract", "remove")
+        print(json.dumps({"tools": [{"id": t, "label": TOOLS[t][0], "options": tool_option_keys(t),
+                                     "ask": asks(t, ask) or (t == "split-pdf" and needs_pages)}
+                                    for t in tools]}))
     else:
         print(" ".join(tools))
 
 
-def cmd_run(tool_id, args, progress, want_notify):
+def cmd_info(args, as_json):
+    files = []
+    for arg in args:
+        path = to_path(arg)
+        info = {"path": str(path), "kind": kind_of(path) or "other"}
+        if info["kind"] == "pdf":
+            try:
+                info["pages"] = pdf_pages(path)
+            except ToolError:
+                pass
+        files.append(info)
+    if as_json:
+        print(json.dumps({"files": files}))
+    else:
+        for f in files:
+            print(f["path"], f["kind"], f.get("pages", ""))
+
+
+def describe(tool_id, opts, kind=None):
+    if tool_id == "compress":
+        return f"Compress, {opts['compress.level']}"
+    if tool_id == "rotate":
+        extra = f", pages {opts['rotate.pages'].strip()}" if kind == "pdf" and opts["rotate.pages"].strip() else ""
+        return f"Rotate {opts['rotate.angle']}°{extra}"
+    if tool_id == "resize-half":
+        return f"Resize to {opts['resize-half.scale']}%"
+    if tool_id == "snapshot":
+        return f"Snapshot at {opts['snapshot.at']}%"
+    if tool_id == "trim-silence":
+        return f"Trim silence below {opts['trim-silence.threshold']} dB"
+    return TOOLS[tool_id][0]
+
+
+def cmd_check(tool_id, opt_args, args):
+    """Dry run: never writes. Returns the JSON dict; bad options or files give ok false."""
     if tool_id not in TOOLS:
         raise ToolError(f"unknown tool: {tool_id}")
+    bad = {"ok": False, "outputs": 0, "summary": ""}
+    try:
+        opts = resolve_options(tool_id, opt_args, peel_config(), len(args))
+    except ToolError as error:
+        return {**bad, "error": str(error)}
+    outputs, summary = 0, ""
+    if tool_id == "merge-pdf":
+        try:
+            sources = []
+            for arg in args:
+                try:
+                    src = to_path(arg)
+                    if kind_of(src) != "pdf":
+                        raise ToolError("not a PDF")
+                except ToolError as error:
+                    raise ToolError(f"{Path(arg).name}: {error}")
+                sources.append(src)
+            if len(sources) < 2:
+                raise ToolError("Merge PDFs needs at least two PDFs")
+            _, summary = plan_merge(sources, opts)
+        except ToolError as error:
+            return {**bad, "error": str(error)}
+        return {"ok": True, "error": "", "outputs": 1, "summary": summary[:120]}
+    for index, arg in enumerate(args):
+        try:
+            src = to_path(arg)
+            kind = kind_of(src)
+            if not tool_ok(tool_id, [kind], 1):
+                raise ToolError(f"{TOOLS[tool_id][0]} does not apply to this file type")
+            if tool_id == "compress" and kind == "audio" and ext_of(src) not in LOSSY_AUDIO:
+                raise ToolError("lossless audio, nothing to compress")
+            if tool_id == "rotate" and kind == "pdf":
+                pdf_selection(opts["rotate.pages"], src)
+            if tool_id == "split-pdf":
+                plan = plan_split(opts, pdf_pages(src))
+                outputs += len(plan)
+                text = split_summary(plan)
+            else:
+                outputs += 1
+                text = describe(tool_id, opts, kind)
+        except ToolError as error:
+            return {**bad, "error": f"{Path(arg).name}: {error}"}
+        summary = summary or text
+    return {"ok": True, "error": "", "outputs": outputs, "summary": summary[:120]}
+
+
+def cmd_run(tool_id, args, progress, want_notify, opt_args=()):
+    if tool_id not in TOOLS:
+        raise ToolError(f"unknown tool: {tool_id}")
+    config = peel_config()
+    opts = resolve_options(tool_id, opt_args, config, len(args))  # validated before any work starts
     label = TOOLS[tool_id][0]
     outputs, failures, skipped = [], [], 0
     total = len(args)
-    outdir = output_dir(progress)
+    outdir = output_dir(progress, config)
 
     if tool_id == "merge-pdf":
         sources = []
@@ -534,7 +955,8 @@ def cmd_run(tool_id, args, progress, want_notify):
         if not failures:
             emit(progress, event="start", index=0, total=1, file=str(sources[0]))
             try:
-                result = run_merge(sources, outdir)
+                pieces, _ = plan_merge(sources, opts)
+                result = run_merge(sources, outdir, pieces)
                 outputs.append(result)
                 emit(progress, event="done", index=0, file=str(sources[0]), output=str(result))
                 if not progress:
@@ -559,14 +981,14 @@ def cmd_run(tool_id, args, progress, want_notify):
                 if tool_id == "split-pdf":
                     if not tool_ok(tool_id, [kind_of(src)], 1):
                         raise ToolError("Split pages only applies to PDFs")
-                    results = run_split(src, report, outdir)
+                    results = run_split(src, report, outdir, opts)
                 else:
-                    results = run_simple(tool_id, src, report, outdir)
+                    results = run_simple(tool_id, src, report, outdir, opts)
             except Skip as why:
                 skipped += 1
                 emit(progress, event="skipped", index=index, file=str(src), reason=str(why))
                 continue
-            except ToolError as error:
+            except (ToolError, OSError) as error:
                 failures.append((str(src), str(error)))
                 emit(progress, event="error", index=index, file=str(src), message=str(error))
                 continue
@@ -601,8 +1023,17 @@ def parser():
     t = sub.add_parser("targets", help="list the tools valid for all FILEs")
     t.add_argument("--json", action="store_true")
     t.add_argument("files", nargs="+", metavar="FILE")
+    i = sub.add_parser("info", help="describe FILEs (kind, PDF page count)")
+    i.add_argument("--json", action="store_true")
+    i.add_argument("files", nargs="+", metavar="FILE")
+    c = sub.add_parser("check", help="dry-run a tool with options; never writes")
+    c.add_argument("--json", action="store_true")
+    c.add_argument("--tool", required=True, metavar="ID")
+    c.add_argument("--opt", action="append", default=[], metavar="KEY=VALUE")
+    c.add_argument("files", nargs="+", metavar="FILE")
     r = sub.add_parser("run", help="run one tool on FILE...")
     r.add_argument("--tool", required=True, metavar="ID")
+    r.add_argument("--opt", action="append", default=[], metavar="KEY=VALUE", help="tool option, repeatable")
     r.add_argument("--progress", action="store_true", help="print JSON progress events")
     r.add_argument("--notify", action="store_true", help="send a desktop notification when done")
     r.add_argument("files", nargs="+", metavar="FILE")
@@ -611,11 +1042,20 @@ def parser():
 
 def main(argv):
     args = parser().parse_args(argv)
+    for sig in (signal.SIGTERM, signal.SIGINT):  # exit through the normal cleanup
+        signal.signal(sig, lambda number, frame: sys.exit(128 + number))
     try:
         if args.command == "targets":
             cmd_targets(args.files, args.json)
             return 0
-        return cmd_run(args.tool, args.files, args.progress, args.notify)
+        if args.command == "info":
+            cmd_info(args.files, args.json)
+            return 0
+        if args.command == "check":
+            result = cmd_check(args.tool, args.opt, args.files)
+            print(json.dumps(result) if args.json else (result["summary"] or result["error"]))
+            return 0
+        return cmd_run(args.tool, args.files, args.progress, args.notify, args.opt)
     except ToolError as error:
         print(f"peel-tool: {error}", file=sys.stderr)
         return 1
